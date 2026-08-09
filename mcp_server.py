@@ -311,6 +311,8 @@ def add_button(
     delay_ms: int | None = None,
     text: str | None = None,
     app_id: str | None = None,
+    row_span: int | None = None,
+    col_span: int | None = None,
 ) -> dict:
     """Aggiunge un nuovo pulsante nella cella (row, col) della griglia
     (indici da 0) della dashboard indicata. La cella deve essere libera e
@@ -373,6 +375,11 @@ def add_button(
       vocale le riconosce allo stesso modo.
     Ne' "record" ne' "ai_command" supportano `color`/`icon`: il loro
     aspetto segue lo stato della registrazione.
+
+    `row_span`/`col_span` (opzionali, default 1) rendono il pulsante piu'
+    alto/largo di una cella: usali per dare rilievo a quelli che si premono
+    piu' spesso. L'area che occupa deve stare dentro la griglia e non
+    sovrapporsi ad altri pulsanti.
 
     `color` (opzionale, formato "#RRGGBB") e `icon` (opzionale, uno dei nomi
     elencati sotto) determinano l'aspetto del pulsante sul telefono — per
@@ -443,6 +450,10 @@ def add_button(
         payload["text"] = text
     if app_id is not None:
         payload["app_id"] = app_id
+    if row_span is not None:
+        payload["row_span"] = row_span
+    if col_span is not None:
+        payload["col_span"] = col_span
     return _control_request(payload)["layout"]
 
 
@@ -470,6 +481,8 @@ def add_buttons(dashboard_id: str, buttons: list[dict]) -> dict:
     - text (str, obbligatorio se kind="text")
     - app_id (str, obbligatorio se kind="launch", da list_launchable_apps)
     - row, col (int, obbligatori, indici da 0)
+    - row_span, col_span (int, opzionali, default 1: quante celle occupa il
+      pulsante, per farlo piu' grande degli altri)
     - color (str, opzionale, "#RRGGBB", non per i pulsanti microfono)
     - icon (str, opzionale, uno dei nomi elencati in add_button, non per i
       pulsanti microfono)
@@ -499,6 +512,8 @@ def edit_button(
     delay_ms: int | None = None,
     text: str | None = None,
     app_id: str | None = None,
+    row_span: int | None = None,
+    col_span: int | None = None,
 ) -> dict:
     """Modifica un pulsante gia' esistente (vedi list_dashboards per l'id)
     senza ricrearlo: cambia l'etichetta e/o l'azione che esegue, mantenendo
@@ -511,7 +526,10 @@ def edit_button(
       solo per kind="macro";
     - `text`: il nuovo snippet da incollare, solo per kind="text";
     - `app_id`: l'applicazione da avviare, solo per kind="launch" (id da
-      list_launchable_apps; l'etichetta segue il nome dell'applicazione).
+      list_launchable_apps; l'etichetta segue il nome dell'applicazione);
+    - `row_span`/`col_span`: quante celle occupa il pulsante, per renderlo
+      piu' grande degli altri (deve restare dentro la griglia e non
+      sovrapporsi a nessuno).
 
     Passare un campo che non appartiene al tipo del pulsante (es. `combo` a
     una macro) e' un errore: usa `combos` per le macro. Per colore e icona
@@ -530,6 +548,10 @@ def edit_button(
         payload["text"] = text
     if app_id is not None:
         payload["app_id"] = app_id
+    if row_span is not None:
+        payload["row_span"] = row_span
+    if col_span is not None:
+        payload["col_span"] = col_span
     return _control_request(payload)["layout"]
 
 

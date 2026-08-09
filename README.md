@@ -519,6 +519,17 @@ e tenendo d'occhio chi ha silenziato per una ventina di secondi dopo la
 dettatura. Su Windows e macOS il rilevamento non e' implementato: nessun
 pulsante e nessun silenziamento.
 
+### Pulsanti piu' grandi di una cella
+
+`row_span`/`col_span` (default 1) dicono quante celle occupa un pulsante:
+servono a dare rilievo a quelli che si premono piu' spesso. Si impostano
+alla creazione (`add_button`) o dopo (`edit_button`, ed e' cosi' che li
+cambia l'app dal telefono). L'area deve stare dentro la griglia e non
+sovrapporsi ad altri pulsanti; ridurre la griglia con un pulsante esteso
+fuori dai nuovi limiti viene rifiutato, come per un pulsante normale. Nel
+layout salvato i valori pari a 1 non vengono scritti, quindi i layout di
+chi non usa questa funzione restano identici a prima.
+
 ### Icone delle applicazioni
 
 Il telefono disegna in filigrana, dietro i pulsanti, l'icona vera

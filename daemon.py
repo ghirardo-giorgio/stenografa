@@ -131,6 +131,59 @@ BUTTON_KINDS = MIC_KINDS + ("keys", "launch", "text", "macro", "paste_last")
 # eseguite in ordine con una breve pausa fra l'una e l'altra, per i flussi
 # che altrimenti richiederebbero tre tocchi separati (es. salva, cambia
 # finestra, incolla).
+# Un pulsante puo' occupare piu' celle (piu' largo/alto degli altri, per
+# dare rilievo a quelli che si premono spesso). Il limite serve solo a
+# fermare valori assurdi: la validazione vera e' che stia dentro la griglia
+# e non si sovrapponga a nessun altro.
+BUTTON_MAX_SPAN = 8
+
+
+def _button_cells(row, col, row_span=1, col_span=1):
+    """Celle occupate da un pulsante, estensione compresa."""
+    return {
+        (r, c)
+        for r in range(row, row + row_span)
+        for c in range(col, col + col_span)
+    }
+
+
+def _cells_of(button):
+    return _button_cells(
+        button["row"],
+        button["col"],
+        button.get("row_span", 1),
+        button.get("col_span", 1),
+    )
+
+
+def _validate_spans(spec, current=None):
+    """Estensione di un pulsante in celle. `current` e' il pulsante da
+    modificare, per lasciare invariato cio' che non e' stato indicato.
+    Ritorna (row_span, col_span, errore)."""
+    base = current or {}
+    values = {}
+    for key in ("row_span", "col_span"):
+        value = spec.get(key, base.get(key, 1))
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None, None, f"{key} deve essere un intero"
+        if not (1 <= value <= BUTTON_MAX_SPAN):
+            return None, None, (
+                f"{key} deve essere fra 1 e {BUTTON_MAX_SPAN} "
+                "(quante celle occupa il pulsante)"
+            )
+        values[key] = value
+    return values["row_span"], values["col_span"], None
+
+
+def _occupied_cells(buttons, exclude_id=None):
+    cells = set()
+    for button in buttons:
+        if exclude_id is not None and button["id"] == exclude_id:
+            continue
+        cells |= _cells_of(button)
+    return cells
+
+
 MACRO_MAX_STEPS = 20
 MACRO_DEFAULT_DELAY_MS = 120
 MACRO_MAX_DELAY_MS = 5000
@@ -1736,8 +1789,21 @@ class Stenografa:
                 f"({rows}x{cols}) di '{dashboard['name']}'; usa set_grid_size "
                 "per ingrandirla"
             )
-        if (row, col) in occupied:
-            return None, f"cella ({row},{col}) gia' occupata in '{dashboard['name']}'"
+        row_span, col_span, error = _validate_spans(spec)
+        if error:
+            return None, error
+        if row + row_span > rows or col + col_span > cols:
+            return None, (
+                f"un pulsante {col_span}x{row_span} in ({row},{col}) esce "
+                f"dalla griglia ({rows}x{cols}) di '{dashboard['name']}'; usa "
+                "set_grid_size per ingrandirla"
+            )
+        wanted = _button_cells(row, col, row_span, col_span)
+        clash = sorted(wanted & occupied)
+        if clash:
+            return None, (
+                f"cella {clash[0]} gia' occupata in '{dashboard['name']}'"
+            )
 
         button = {
             "id": self._new_button_id(label, existing_ids),
@@ -1746,6 +1812,12 @@ class Stenografa:
             "row": row,
             "col": col,
         }
+        # si scrivono solo se diversi da 1: il layout di chi non usa i
+        # pulsanti estesi resta identico a prima
+        if row_span != 1:
+            button["row_span"] = row_span
+        if col_span != 1:
+            button["col_span"] = col_span
         if kind in MIC_KINDS:
             # niente combo/colore/icona: questi pulsanti "microfono"
             # controllano avvio/stop registrazione (con o senza
@@ -1884,7 +1956,7 @@ class Stenografa:
         existing_ids = {
             b["id"] for d in self.layout["dashboards"] for b in d["buttons"]
         }
-        occupied = {(b["row"], b["col"]) for b in dashboard["buttons"]}
+        occupied = _occupied_cells(dashboard["buttons"])
         button, error = self._validate_new_button(
             dashboard, existing_ids, occupied, msg
         )
@@ -1909,7 +1981,7 @@ class Stenografa:
         if not isinstance(specs, list) or not specs:
             return False, "buttons mancante o vuoto (lista di pulsanti da aggiungere)"
 
-        occupied = {(b["row"], b["col"]) for b in dashboard["buttons"]}
+        occupied = _occupied_cells(dashboard["buttons"])
         existing_ids = {
             b["id"] for d in self.layout["dashboards"] for b in d["buttons"]
         }
@@ -1929,7 +2001,7 @@ class Stenografa:
                 errors.append(f"{prefix}: {error}")
                 continue
             existing_ids.add(button["id"])
-            occupied.add((button["row"], button["col"]))
+            occupied |= _cells_of(button)
             new_buttons.append(button)
 
         if errors:
@@ -1941,16 +2013,17 @@ class Stenografa:
         return True, None
 
     def _edit_button_locked(self, msg):
-        """Modifica un pulsante gia' creato: l'etichetta e/o l'azione che
-        esegue (la combinazione di tasti di un "keys", la sequenza di un
-        "macro", lo snippet di un "text", l'applicazione di un "launch"). Cambiare la combinazione senza
-        rifare il pulsante evita di perderne posizione, colore e icona.
+        """Modifica un pulsante gia' creato: l'etichetta, l'azione che esegue
+        (la combinazione di tasti di un "keys", la sequenza di un "macro", lo
+        snippet di un "text", l'applicazione di un "launch") e quante celle
+        occupa. Cambiarlo senza rifarlo evita di perderne posizione, colore
+        e icona.
 
         Ogni campo e' opzionale: quelli assenti restano com'erano. Un campo
         che non appartiene al tipo del pulsante e' un errore, non una
         modifica silenziosamente ignorata."""
         button_id = msg.get("id")
-        _, button = self._find_button_global(button_id)
+        dashboard, button = self._find_button_global(button_id)
         if button is None:
             return False, f"nessun pulsante con id '{button_id}'"
         kind = button["kind"]
@@ -2030,9 +2103,34 @@ class Stenografa:
                 )
             updates["text"] = text
 
+        if "row_span" in msg or "col_span" in msg:
+            row_span, col_span, error = _validate_spans(msg, button)
+            if error:
+                return False, error
+            rows, cols = dashboard["rows"], dashboard["cols"]
+            if button["row"] + row_span > rows or button["col"] + col_span > cols:
+                return False, (
+                    f"un pulsante {col_span}x{row_span} in "
+                    f"({button['row']},{button['col']}) esce dalla griglia "
+                    f"({rows}x{cols}); usa set_grid_size per ingrandirla"
+                )
+            wanted = _button_cells(button["row"], button["col"], row_span, col_span)
+            clash = wanted & _occupied_cells(
+                dashboard["buttons"], exclude_id=button_id
+            )
+            if clash:
+                return False, (
+                    f"ingrandimento non possibile: la cella "
+                    f"{sorted(clash)[0]} e' gia' occupata"
+                )
+            # come alla creazione: si scrivono solo se diversi da 1
+            updates["row_span"] = row_span
+            updates["col_span"] = col_span
+
         if not updates:
             return False, (
-                "nessuna modifica indicata (label, combo, combos, text, app_id)"
+                "nessuna modifica indicata (label, combo, combos, text, "
+                "app_id, row_span, col_span)"
             )
 
         button.update(updates)
@@ -2106,15 +2204,32 @@ class Stenografa:
         rows, cols = dashboard["rows"], dashboard["cols"]
         if not (0 <= row < rows and 0 <= col < cols):
             return False, f"posizione ({row},{col}) fuori dalla griglia ({rows}x{cols})"
-        occupant = next(
-            (
-                b
-                for b in dashboard["buttons"]
-                if b["row"] == row and b["col"] == col and b["id"] != button_id
-            ),
-            None,
-        )
-        if occupant is not None:
+        row_span = button.get("row_span", 1)
+        col_span = button.get("col_span", 1)
+        if row + row_span > rows or col + col_span > cols:
+            return False, (
+                f"un pulsante {col_span}x{row_span} in ({row},{col}) esce "
+                f"dalla griglia ({rows}x{cols})"
+            )
+        wanted = _button_cells(row, col, row_span, col_span)
+        others = [b for b in dashboard["buttons"] if b["id"] != button_id]
+        touched = [b for b in others if _cells_of(b) & wanted]
+        if touched:
+            # lo scambio ha senso solo fra due pulsanti della stessa forma:
+            # con dimensioni diverse finirebbero l'uno sopra l'altro o fuori
+            # griglia, quindi si preferisce dirlo invece di fare pasticci
+            occupant = touched[0]
+            same_shape = (
+                len(touched) == 1
+                and occupant.get("row_span", 1) == row_span
+                and occupant.get("col_span", 1) == col_span
+            )
+            if not same_shape:
+                return False, (
+                    f"la destinazione ({row},{col}) e' occupata da "
+                    f"'{occupant['label']}', di dimensione diversa: liberala "
+                    "prima di spostare qui"
+                )
             occupant["row"], occupant["col"] = button["row"], button["col"]
         button["row"], button["col"] = row, col
         _save_layout(self.layout)
@@ -2136,7 +2251,8 @@ class Stenografa:
         fuori = [
             b
             for b in dashboard["buttons"]
-            if b["row"] >= rows or b["col"] >= cols
+            if b["row"] + b.get("row_span", 1) > rows
+            or b["col"] + b.get("col_span", 1) > cols
         ]
         if fuori:
             etichette = ", ".join(b["label"] for b in fuori)
@@ -2224,7 +2340,7 @@ class Stenografa:
                 button_errors.append(f"{prefix}: {error}")
                 continue
             existing_ids.add(button["id"])
-            occupied.add((button["row"], button["col"]))
+            occupied |= _cells_of(button)
             new_buttons.append(button)
 
         if button_errors:

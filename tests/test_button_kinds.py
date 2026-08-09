@@ -487,3 +487,109 @@ def test_edit_button_rejects_an_unknown_application(app):
 
     assert not ok
     assert "nessuna applicazione installata" in error
+
+
+# --- pulsanti piu' grandi di una cella ---
+# la griglia del fixture e' 2x3 con "record" gia' in (0,0): i test usano la
+# riga 1, libera
+
+
+def test_button_can_span_more_cells(app):
+    ok, error = _add(
+        app, label="Grande", combo="ctrl+g", row=1, col=0, col_span=2
+    )
+
+    assert ok, error
+    assert _find(app, "Grande")["col_span"] == 2
+
+
+def test_span_of_one_is_not_written_in_the_layout(app):
+    """Il layout di chi non usa i pulsanti estesi resta identico a prima."""
+    _add(app, label="Normale", combo="ctrl+n", row=1, col=0)
+
+    button = _find(app, "Normale")
+    assert "row_span" not in button and "col_span" not in button
+
+
+def test_a_big_button_cannot_overlap_another(app):
+    _add(app, label="Vicino", combo="ctrl+v", row=1, col=1)
+
+    ok, error = _add(
+        app, label="Grande", combo="ctrl+g", row=1, col=0, col_span=2
+    )
+
+    assert not ok
+    assert "occupata" in error
+
+
+def test_a_big_button_cannot_stick_out_of_the_grid(app):
+    ok, error = _add(
+        app, label="Enorme", combo="ctrl+e", row=1, col=2, col_span=2
+    )
+
+    assert not ok
+    assert "esce dalla griglia" in error
+
+
+def test_edit_button_can_resize_an_existing_button(app):
+    _add(app, label="Da ingrandire", combo="ctrl+i", row=1, col=0)
+    button_id = _find(app, "Da ingrandire")["id"]
+
+    ok, error = _edit(app, id=button_id, col_span=3)
+
+    assert ok, error
+    assert _find(app, "Da ingrandire")["col_span"] == 3
+
+
+def test_edit_button_refuses_to_resize_over_a_neighbour(app):
+    _add(app, label="Da ingrandire", combo="ctrl+i", row=1, col=0)
+    _add(app, label="Vicino", combo="ctrl+v", row=1, col=1)
+    button_id = _find(app, "Da ingrandire")["id"]
+
+    ok, error = _edit(app, id=button_id, col_span=2)
+
+    assert not ok
+    assert "gia' occupata" in error
+    assert "col_span" not in _find(app, "Da ingrandire")
+
+
+def test_shrinking_the_grid_accounts_for_big_buttons(app):
+    """Una griglia piu' piccola non deve tagliare a meta' un pulsante
+    esteso: prima si rimpicciolisce lui."""
+    _add(app, label="Largo", combo="ctrl+l", row=1, col=0, col_span=3)
+
+    ok, error = app._mutate_layout(
+        "set_grid_size", {"dashboard_id": "default", "rows": 2, "cols": 2}
+    )
+
+    assert not ok
+    assert "Largo" in error
+
+
+def test_moving_onto_a_big_button_is_refused(app):
+    _add(app, label="Largo", combo="ctrl+l", row=1, col=0, col_span=2)
+    _add(app, label="Piccolo", combo="ctrl+p", row=0, col=1)
+    small_id = _find(app, "Piccolo")["id"]
+
+    ok, error = app._mutate_layout(
+        "move_button", {"id": small_id, "row": 1, "col": 1}
+    )
+
+    assert not ok
+    assert "dimensione diversa" in error
+
+
+def test_two_equal_buttons_still_swap_places(app):
+    """Lo scambio trascinando resta com'era per i pulsanti della stessa
+    forma: e' il gesto con cui si riordina la griglia."""
+    _add(app, label="Uno", combo="ctrl+1", row=1, col=0)
+    _add(app, label="Due", combo="ctrl+2", row=1, col=1)
+    first = _find(app, "Uno")["id"]
+
+    ok, error = app._mutate_layout(
+        "move_button", {"id": first, "row": 1, "col": 1}
+    )
+
+    assert ok, error
+    assert (_find(app, "Uno")["row"], _find(app, "Uno")["col"]) == (1, 1)
+    assert (_find(app, "Due")["row"], _find(app, "Due")["col"]) == (1, 0)
