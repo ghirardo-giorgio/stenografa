@@ -1,0 +1,13 @@
+# Dipendenze aggiuntive per il backend macOS (platform_backend.py).
+# Non necessarie su Linux/Windows. Mai testate su un Mac reale: vedi la nota
+# in cima a platform_backend.py. Richiede inoltre di concedere manualmente il
+# permesso "Accessibilita'" all'interprete Python (Impostazioni di Sistema >
+# Privacy e Sicurezza > Accessibilita') perche' la simulazione dei tasti
+# funzioni: non e' un permesso installabile via pip.
+pyobjc-framework-Cocoa
+pynput
+sounddevice
+soundfile
+pyperclip
+plyer
+requests

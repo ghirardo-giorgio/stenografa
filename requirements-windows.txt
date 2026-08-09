@@ -1,0 +1,22 @@
+# Dipendenze aggiuntive per il backend Windows (platform_backend.py).
+# Non necessarie su Linux/macOS. Mai testate su una macchina Windows reale:
+# vedi la nota in cima a platform_backend.py.
+pywin32
+pynput
+psutil
+sounddevice
+soundfile
+pyperclip
+plyer
+requests
+
+# Non specifica di Windows (serve anche su Linux/macOS per la trascrizione,
+# vedi daemon.py): elencata qui perche' non esiste un requirements.txt di
+# base nel repo.
+#
+# ATTENZIONE: su Windows richiede anche il Microsoft Visual C++
+# Redistributable x64 installato a livello di sistema (non installabile via
+# pip), altrimenti l'import fallisce con FileNotFoundError su ctranslate2.dll
+# (mancano vcruntime140.dll/vcruntime140_1.dll/msvcp140.dll):
+#   winget install --id Microsoft.VCRedist.2015+.x64 -e
+faster_whisper
