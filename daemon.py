@@ -818,6 +818,21 @@ MEDIA_POLL_INTERVAL = 2.0  # secondi
 # silenziato, riattivandolo se ricompare muto.
 MUTED_APPS_GUARD_SECONDS = 20.0
 
+# --- attesa che gli appunti siano davvero pronti prima di incollare (vedi
+# _wait_clipboard): il primo incolla dopo un periodo di inattivita' e' il
+# caso in cui il ritardo si nota, perche' i processi che servono la
+# clipboard vanno riavviati.
+CLIPBOARD_READY_TIMEOUT = 2.0
+CLIPBOARD_POLL_INTERVAL = 0.03
+# usata solo dove non si puo' rileggere gli appunti per sapere quando sono
+# pronti: e' la pausa fissa che c'era prima
+CLIPBOARD_FALLBACK_WAIT = 0.1
+
+# pausa fra l'incolla e l'Invio dell'invio automatico: certe applicazioni
+# (chat web soprattutto) elaborano l'incolla in modo asincrono, e un Invio
+# immediato partirebbe con il campo ancora vuoto
+AUTO_ENTER_DELAY = 0.15
+
 # --- incolla adattivo: nella maggior parte degli emulatori di terminale
 # Linux (e in Terminal.app/iTerm su macOS, Windows Terminal/cmd/PowerShell)
 # Ctrl+V non incolla — e' spesso un carattere di controllo o e' semplicemente
@@ -1006,6 +1021,14 @@ class Stenografa:
         # LLM locale ed esegue lo shortcut risultante). Impostata da
         # _handle_button_press in base al kind del pulsante premuto.
         self._recording_mode = "paste"
+        # se la dettatura in corso deve finire con un Invio: lo chiede il
+        # pulsante "record" con l'invio automatico acceso (vedi _paste_text)
+        self._recording_auto_enter = False
+        # vale per l'incolla in arrivo, non per il re-incolla di una voce
+        # passata ne' per gli snippet fissi
+        self._auto_enter_pending = False
+        # stessa cosa per il testo in attesa di approvazione sul telefono
+        self._pending_auto_enter = False
         # dashboard da cui e' stato premuto il pulsante ai_command che ha
         # avviato la registrazione corrente: da' priorita' alle scorciatoie
         # gia' configurate in quella dashboard quando si interpreta il
@@ -1823,6 +1846,9 @@ class Stenografa:
             # controllano avvio/stop registrazione (con o senza
             # interpretazione IA dello shortcut) e il loro aspetto segue lo
             # stato della registrazione, non e' personalizzabile
+            if kind == "record" and spec.get("auto_enter"):
+                # invio automatico dopo l'incolla: vedi _paste_text
+                button["auto_enter"] = True
             return button, None
 
         if kind == "keys":
@@ -2102,6 +2128,17 @@ class Stenografa:
                     f"{TEXT_BUTTON_MAX_LENGTH})"
                 )
             updates["text"] = text
+
+        if "auto_enter" in msg:
+            if kind != "record":
+                return False, (
+                    f"il pulsante '{button['label']}' e' di tipo '{kind}': "
+                    "l'invio automatico vale solo per la dettatura normale"
+                )
+            enabled = msg.get("auto_enter")
+            if not isinstance(enabled, bool):
+                return False, "auto_enter deve essere un booleano"
+            updates["auto_enter"] = enabled
 
         if "row_span" in msg or "col_span" in msg:
             row_span, col_span, error = _validate_spans(msg, button)
@@ -2533,12 +2570,16 @@ class Stenografa:
 
         if kind in MIC_KINDS:
             mode = "ai_command" if kind == "ai_command" else "paste"
+            auto_enter = bool(button.get("auto_enter"))
             if phase == "down":
                 # gia' in registrazione: il "down" e' un doppione (es. due
                 # telefoni collegati), non un secondo comando da eseguire
                 if self.state == STATE_IDLE:
                     self.toggle_recording(
-                        mode=mode, dashboard_id=dashboard_id, phase=phase
+                        mode=mode,
+                        dashboard_id=dashboard_id,
+                        phase=phase,
+                        auto_enter=auto_enter,
                     )
             elif phase == "up":
                 if self.state == STATE_RECORDING:
@@ -2547,7 +2588,10 @@ class Stenografa:
                     )
             else:
                 self.toggle_recording(
-                    mode=mode, dashboard_id=dashboard_id, phase=phase
+                    mode=mode,
+                    dashboard_id=dashboard_id,
+                    phase=phase,
+                    auto_enter=auto_enter,
                 )
             return
 
@@ -2981,10 +3025,13 @@ class Stenografa:
 
     # --- registrazione / trascrizione ---
 
-    def toggle_recording(self, mode="paste", dashboard_id=None, phase="tap"):
+    def toggle_recording(
+        self, mode="paste", dashboard_id=None, phase="tap", auto_enter=False
+    ):
         if self.state == STATE_IDLE:
             self._recording_mode = mode
             self._recording_dashboard_id = dashboard_id
+            self._recording_auto_enter = auto_enter
             self._start_recording(phase=phase)
         elif self.state == STATE_RECORDING:
             self._stop_recording_and_transcribe()
@@ -3137,6 +3184,10 @@ class Stenografa:
         self._recording_mode = "paste"
         dashboard_id = self._recording_dashboard_id
         self._recording_dashboard_id = None
+        # l'invio automatico vale per questa dettatura, non per il
+        # re-incolla di una voce passata o per uno snippet fisso
+        self._auto_enter_pending = self._recording_auto_enter
+        self._recording_auto_enter = False
         clipboard_before = self._clipboard_before
         self._clipboard_before = None
         if error:
@@ -3178,10 +3229,14 @@ class Stenografa:
         """Ultimo passaggio del testo dettato (gia' eventualmente tradotto):
         lo incolla subito, oppure — se "conferma prima di incollare" e'
         attiva — lo propone al telefono e aspetta l'approvazione."""
+        auto_enter = self._auto_enter_pending
+        self._auto_enter_pending = False
         if self.confirm_before_paste:
+            # con la conferma attiva l'Invio parte dopo l'approvazione
+            self._pending_auto_enter = auto_enter
             self._request_paste_confirmation(text, clipboard_before)
             return
-        self._paste_text(text, clipboard_before)
+        self._paste_text(text, clipboard_before, auto_enter=auto_enter)
 
     # --- conferma dell'incolla (config "confirm_before_paste") ---
 
@@ -3222,7 +3277,11 @@ class Stenografa:
         final_text = pending["text"]
         if isinstance(text, str) and text.strip():
             final_text = text[:TEXT_BUTTON_MAX_LENGTH]
-        self._paste_text(final_text, pending["clipboard_before"])
+        auto_enter = getattr(self, "_pending_auto_enter", False)
+        self._pending_auto_enter = False
+        self._paste_text(
+            final_text, pending["clipboard_before"], auto_enter=auto_enter
+        )
 
     def _cancel_pending_paste(self, request_id=None, reason="cancelled"):
         """Chiude la conferma in sospeso senza incollare. Il testo resta
@@ -3327,6 +3386,31 @@ class Stenografa:
         # nuova dettatura, e non deve comparire due volte nell'elenco
         self._paste_text(entry["text"], clipboard_before, remember=False)
 
+    def _wait_clipboard(self, text):
+        """Aspetta che gli appunti contengano davvero il testo prima di
+        simulare l'incolla.
+
+        Copiare non e' istantaneo: su Wayland il programma che copia diventa
+        proprietario della selezione e il compositor la registra con qualche
+        decimo di ritardo — di piu' al primo incolla dopo un periodo di
+        inattivita', quando i processi coinvolti vanno riavviati. Con una
+        pausa fissa capitava di premere Ctrl+V troppo presto e di incollare
+        quello che c'era negli appunti da prima, invece del testo appena
+        dettato.
+
+        Se il backend non sa rileggere gli appunti si ripiega sulla vecchia
+        pausa fissa: meglio un'attesa alla cieca che nessuna attesa."""
+        deadline = time.monotonic() + CLIPBOARD_READY_TIMEOUT
+        while time.monotonic() < deadline:
+            current = self.backend.read_clipboard()
+            if current is None:
+                time.sleep(CLIPBOARD_FALLBACK_WAIT)
+                return False
+            if current == text:
+                return True
+            time.sleep(CLIPBOARD_POLL_INTERVAL)
+        return False
+
     def _paste_combo(self):
         """Combinazione di tasti da usare per incollare: "ctrl+v", oppure
         "ctrl+shift+v" se la finestra col focus sembra un emulatore di
@@ -3342,7 +3426,7 @@ class Stenografa:
             return "ctrl+shift+v"
         return "ctrl+v"
 
-    def _paste_text(self, text, clipboard_before, remember=True):
+    def _paste_text(self, text, clipboard_before, remember=True, auto_enter=False):
         """Copia `text` negli appunti e simula l'incolla: usato sia per il
         testo dettato cosi' com'e' sia, dopo la traduzione via LLM, per il
         testo gia' tradotto (vedi _on_translate_done).
@@ -3351,9 +3435,7 @@ class Stenografa:
         deve entrare: il re-incolla di una voce passata e gli snippet fissi
         dei pulsanti kind="text", che non sono dettature."""
         self.backend.copy_to_clipboard(text)
-        # piccola pausa difensiva: garantisce che l'offerta clipboard sia
-        # gia' registrata dal compositor prima di simulare il paste
-        time.sleep(0.1)
+        self._wait_clipboard(text)
         combo = self._paste_combo()
         pasted = self.backend.simulate_keys(combo)
         preview = text if len(text) <= 200 else text[:200] + "..."
@@ -3362,6 +3444,14 @@ class Stenografa:
             # comparso nella finestra col focus, la notifica sarebbe solo
             # un doppione che copre l'interfaccia. Restano notificati i
             # casi in cui l'utente non vede nulla (incolla fallito, errori)
+            if auto_enter:
+                # invio automatico: in una chat il messaggio parte da solo,
+                # senza dover toccare la tastiera del PC. Una pausa breve
+                # perche' certe applicazioni elaborano l'incolla in modo
+                # asincrono e un Invio troppo rapido arriverebbe prima che
+                # il testo sia nel campo
+                time.sleep(AUTO_ENTER_DELAY)
+                self.backend.simulate_keys("enter")
             # ripristina gli appunti precedenti solo se l'incolla e'
             # riuscito: se fosse fallito il testo dettato deve restare negli
             # appunti come alternativa manuale (Ctrl+V dell'utente)

@@ -189,7 +189,9 @@ def test_handle_button_press_ai_command_passes_dashboard_id(daemon_app):
     calls = []
     daemon_app.state = daemon.STATE_IDLE
 
-    def fake_toggle_recording(mode="paste", dashboard_id=None, phase="tap"):
+    def fake_toggle_recording(
+        mode="paste", dashboard_id=None, phase="tap", auto_enter=False
+    ):
         calls.append((mode, dashboard_id))
 
     daemon_app.toggle_recording = fake_toggle_recording
@@ -302,6 +304,10 @@ def test_on_transcription_done_paste_mode_unaffected(daemon_app):
 
         def copy_to_clipboard(self, text):
             calls.append(("copy", text))
+            self.clipboard = text
+
+        def read_clipboard(self):
+            return getattr(self, "clipboard", None)
 
         def simulate_keys(self, combo):
             calls.append(("paste", combo))

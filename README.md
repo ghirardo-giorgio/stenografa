@@ -485,6 +485,21 @@ resta adeguata allo scopo. Le impostazioni dell'app mostrano se il canale in
 uso e' cifrato e con quale impronta, da confrontare con quella riportata da
 `get_config` sul PC.
 
+### Invio automatico dopo la dettatura
+
+Un pulsante `kind: "record"` con `auto_enter` acceso preme **Invio** subito
+dopo aver incollato: in una chat il messaggio dettato parte da solo, senza
+toccare la tastiera del PC. Sul telefono si accende e si spegne con la
+spunta sul pulsante stesso, perche' e' una scelta che cambia di continuo —
+in chat serve, in un editor sarebbe un guaio.
+
+Vale solo per la dettatura di quel pulsante: non per il comando vocale IA
+(che non incolla testo), non per il re-incolla di una voce passata e non per
+gli snippet fissi. Con "conferma prima di incollare" attiva, l'Invio parte
+dopo l'approvazione. Fra l'incolla e l'Invio c'e' una breve pausa: certe
+chat web elaborano l'incolla in modo asincrono e un Invio immediato
+partirebbe a campo ancora vuoto.
+
 ### Incolla ultimo
 
 Un pulsante `kind: "paste_last"` re-incolla l'ultima dettatura senza

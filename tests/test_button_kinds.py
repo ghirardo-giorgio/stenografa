@@ -593,3 +593,93 @@ def test_two_equal_buttons_still_swap_places(app):
     assert ok, error
     assert (_find(app, "Uno")["row"], _find(app, "Uno")["col"]) == (1, 1)
     assert (_find(app, "Due")["row"], _find(app, "Due")["col"]) == (1, 0)
+
+
+# --- invio automatico dopo la dettatura (pulsante "record") ---
+
+
+def test_record_button_can_ask_for_automatic_enter(app):
+    ok, error = _add(app, kind="record", label="Detta e invia", row=1, col=0,
+                     auto_enter=True)
+
+    assert ok, error
+    assert _find(app, "Detta e invia")["auto_enter"] is True
+
+
+def test_automatic_enter_is_off_unless_asked(app):
+    _add(app, kind="record", label="Detta", row=1, col=0)
+
+    assert "auto_enter" not in _find(app, "Detta")
+
+
+def test_automatic_enter_can_be_toggled_later(app):
+    _add(app, kind="record", label="Detta", row=1, col=0)
+    button_id = _find(app, "Detta")["id"]
+
+    ok, error = _edit(app, id=button_id, auto_enter=True)
+    assert ok, error
+    assert _find(app, "Detta")["auto_enter"] is True
+
+    ok, error = _edit(app, id=button_id, auto_enter=False)
+    assert ok, error
+    assert _find(app, "Detta")["auto_enter"] is False
+
+
+def test_automatic_enter_is_only_for_dictation(app):
+    """Su un comando vocale IA non ha senso: non incolla testo."""
+    _add(app, kind="ai_command", label="Comando", row=1, col=0)
+    button_id = _find(app, "Comando")["id"]
+
+    ok, error = _edit(app, id=button_id, auto_enter=True)
+
+    assert not ok
+    assert "dettatura normale" in error
+
+
+def test_dictation_presses_enter_after_pasting(app, monkeypatch):
+    monkeypatch.setattr(daemon_module.threading, "Thread", _ImmediateThread)
+    _add(app, kind="record", label="Detta e invia", row=1, col=0,
+         auto_enter=True)
+    button_id = _find(app, "Detta e invia")["id"]
+    app.state = daemon_module.STATE_IDLE
+    monkeypatch.setattr(
+        daemon_module.Stenografa, "_start_recording",
+        lambda self, phase="tap": setattr(self, "state", daemon_module.STATE_RECORDING),
+    )
+    monkeypatch.setattr(daemon_module, "AUTO_ENTER_DELAY", 0)
+
+    app._handle_button_press(button_id)          # avvia la dettatura
+    app.state = daemon_module.STATE_IDLE
+    app._on_transcription_done("ciao a tutti", None)
+
+    assert app.backend.keys == ["ctrl+v", "enter"]
+
+
+def test_dictation_without_the_option_does_not_press_enter(app, monkeypatch):
+    monkeypatch.setattr(daemon_module.threading, "Thread", _ImmediateThread)
+    _add(app, kind="record", label="Detta", row=1, col=0)
+    button_id = _find(app, "Detta")["id"]
+    app.state = daemon_module.STATE_IDLE
+    monkeypatch.setattr(
+        daemon_module.Stenografa, "_start_recording",
+        lambda self, phase="tap": setattr(self, "state", daemon_module.STATE_RECORDING),
+    )
+
+    app._handle_button_press(button_id)
+    app.state = daemon_module.STATE_IDLE
+    app._on_transcription_done("ciao a tutti", None)
+
+    assert app.backend.keys == ["ctrl+v"]
+
+
+def test_repasting_from_history_never_presses_enter(app, monkeypatch):
+    """L'invio automatico vale per la dettatura appena fatta, non per il
+    re-incolla di una voce passata."""
+    monkeypatch.setattr(daemon_module.threading, "Thread", _ImmediateThread)
+    _add(app, kind="record", label="Detta e invia", row=1, col=0,
+         auto_enter=True)
+    app._history_add("una frase di ieri", pasted=True)
+
+    app._paste_last_dictation()
+
+    assert app.backend.keys == ["ctrl+v"]

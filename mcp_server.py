@@ -313,6 +313,7 @@ def add_button(
     app_id: str | None = None,
     row_span: int | None = None,
     col_span: int | None = None,
+    auto_enter: bool | None = None,
 ) -> dict:
     """Aggiunge un nuovo pulsante nella cella (row, col) della griglia
     (indici da 0) della dashboard indicata. La cella deve essere libera e
@@ -375,6 +376,11 @@ def add_button(
       vocale le riconosce allo stesso modo.
     Ne' "record" ne' "ai_command" supportano `color`/`icon`: il loro
     aspetto segue lo stato della registrazione.
+
+    `auto_enter` (opzionale, solo per kind="record") fa premere Invio dopo
+    l'incolla: in una chat il messaggio dettato parte da solo, senza toccare
+    la tastiera del PC. Sul telefono si accende e spegne dalla spunta sul
+    pulsante stesso.
 
     `row_span`/`col_span` (opzionali, default 1) rendono il pulsante piu'
     alto/largo di una cella: usali per dare rilievo a quelli che si premono
@@ -454,6 +460,8 @@ def add_button(
         payload["row_span"] = row_span
     if col_span is not None:
         payload["col_span"] = col_span
+    if auto_enter is not None:
+        payload["auto_enter"] = auto_enter
     return _control_request(payload)["layout"]
 
 
@@ -514,6 +522,7 @@ def edit_button(
     app_id: str | None = None,
     row_span: int | None = None,
     col_span: int | None = None,
+    auto_enter: bool | None = None,
 ) -> dict:
     """Modifica un pulsante gia' esistente (vedi list_dashboards per l'id)
     senza ricrearlo: cambia l'etichetta e/o l'azione che esegue, mantenendo
@@ -529,7 +538,9 @@ def edit_button(
       list_launchable_apps; l'etichetta segue il nome dell'applicazione);
     - `row_span`/`col_span`: quante celle occupa il pulsante, per renderlo
       piu' grande degli altri (deve restare dentro la griglia e non
-      sovrapporsi a nessuno).
+      sovrapporsi a nessuno);
+    - `auto_enter`: solo per kind="record", se dopo l'incolla il PC deve
+      premere Invio (in chat il messaggio dettato parte da solo).
 
     Passare un campo che non appartiene al tipo del pulsante (es. `combo` a
     una macro) e' un errore: usa `combos` per le macro. Per colore e icona
@@ -552,6 +563,8 @@ def edit_button(
         payload["row_span"] = row_span
     if col_span is not None:
         payload["col_span"] = col_span
+    if auto_enter is not None:
+        payload["auto_enter"] = auto_enter
     return _control_request(payload)["layout"]
 
 

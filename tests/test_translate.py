@@ -178,6 +178,10 @@ def test_on_transcription_done_translates_via_llm_and_pastes(daemon_app, monkeyp
 
         def copy_to_clipboard(self, text):
             calls.append(("copy", text))
+            self.clipboard = text
+
+        def read_clipboard(self):
+            return getattr(self, "clipboard", None)
 
         def simulate_keys(self, combo):
             calls.append(("paste", combo))
@@ -219,6 +223,10 @@ def test_on_transcription_done_english_whisper_translate_skips_llm(daemon_app):
 
         def copy_to_clipboard(self, text):
             calls.append(("copy", text))
+            self.clipboard = text
+
+        def read_clipboard(self):
+            return getattr(self, "clipboard", None)
 
         def simulate_keys(self, combo):
             calls.append(("paste", combo))
@@ -248,6 +256,10 @@ def test_on_translate_done_notifies_error_without_pasting(daemon_app):
 
         def copy_to_clipboard(self, text):
             calls.append(("copy", text))
+            self.clipboard = text
+
+        def read_clipboard(self):
+            return getattr(self, "clipboard", None)
 
         def simulate_keys(self, combo):
             calls.append(("paste", combo))

@@ -34,6 +34,9 @@ def daemon_app(tmp_path, monkeypatch):
     app._clipboard_before = None
     app._recording_mode = "paste"
     app._recording_dashboard_id = None
+    app._recording_auto_enter = False
+    app._auto_enter_pending = False
+    app._pending_auto_enter = False
     app._recording_vocabulary = ""
     app._recording_watchdog_timer = None
     app.translate_enabled = False

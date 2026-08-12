@@ -157,6 +157,10 @@ def test_restore_clipboard_only_after_successful_paste(daemon_app, monkeypatch):
 
         def copy_to_clipboard(self, text):
             calls.append(("copy", text))
+            self.clipboard = text
+
+        def read_clipboard(self):
+            return getattr(self, "clipboard", None)
 
         def simulate_keys(self, combo):
             calls.append(("paste", combo))
@@ -186,6 +190,10 @@ def test_restore_clipboard_after_successful_paste(daemon_app):
 
         def copy_to_clipboard(self, text):
             calls.append(("copy", text))
+            self.clipboard = text
+
+        def read_clipboard(self):
+            return getattr(self, "clipboard", None)
 
         def simulate_keys(self, combo):
             calls.append(("paste", combo))
