@@ -1,865 +1,414 @@
 # Stenografa
 
-Dettatura vocale con Whisper. Una scorciatoia da tastiera GNOME (o l'app
-Flutter da telefono, vedi sotto) avvia/ferma la registrazione; al termine il
-testo trascritto viene copiato negli appunti, incollato automaticamente nella
-finestra col focus e mostrato in una notifica. Il demone non ha interfaccia
-grafica: il riscontro arriva dalle notifiche desktop e dallo stato mostrato
-nell'app telefono.
+Voice dictation for Linux that types for you: hit a keyboard shortcut (or a
+button on your phone), speak, and the transcript is pasted straight into
+whatever window has focus. Built on
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) with hands-off
+GPU/CPU handling, pairs with a Flutter phone app over your local network, and
+can be driven by any MCP client.
 
-## Componenti
+> **Status:** Linux is the reference implementation — implemented, verified and
+> in daily use. Windows and macOS backends are written but **never tested on a
+> real machine**. See [Platform support](#platform-support).
 
-- `daemon.py` — demone (senza interfaccia grafica) in ascolto su un socket unix
-  (`$XDG_RUNTIME_DIR/stenografa.sock`) e su un server TCP (porta 8765) per il
-  controllo remoto da rete locale. Gestisce registrazione, trascrizione
-  (`faster-whisper` su GPU, modello `medium`) e incolla automaticamente il
-  risultato. Le operazioni specifiche del sistema operativo sono isolate in
-  `platform_backend.py` (vedi "Compatibilita' Windows/macOS" sotto).
-- `platform_backend.py` — layer di astrazione OS (audio, appunti, simulazione
-  tasti, notifiche, rilevamento finestra col focus): Linux implementato e
-  verificato, Windows/macOS scritti ma non ancora testati su una macchina
-  reale.
-- `llm_provider.py` — backend LLM intercambiabili (LM Studio, Ollama, OpenAI,
-  API Claude, CLI Claude Code) usati da comando vocale IA, traduzione e
-  traduzioni. Vedi "Scegliere il backend LLM" sotto.
-- `setup_llm.py` — script interattivo che compone `~/.config/stenografa/llm.json`
-  (quale backend usare, modello, credenziali) e ne verifica il funzionamento.
-- `key_combo.py` — parsing/validazione delle combinazioni di tasti (es.
-  `ctrl+c`), indipendente dal sistema operativo.
-- `toggle.py` — invia il comando di avvio/stop al demone tramite il socket
-  unix locale. Va collegato a una scorciatoia da tastiera.
-- `RecordAndPaste` (`/home/oberon/Documents/Development/Flutter/RecordAndPaste`)
-  — app Flutter per telefono: una griglia di pulsanti a schermo intero
-  (registrazione, comandi vocali interpretati da IA, scorciatoie
-  personalizzate) controllata da remoto sulla stessa rete WiFi, vedi sotto.
-- `mcp_server.py` — server MCP (stdio) che espone come tool la gestione
-  della griglia di pulsanti dell'app telefono e della configurazione del
-  demone, cosi' un client MCP puo' comporla a partire da una richiesta in
-  linguaggio naturale. Vedi sotto.
-- `tests/` — suite pytest sulla logica pura del demone (validazione layout,
-  configurazione, comando vocale IA); non richiede audio/GPU/rete reali.
+## How it works
 
-Il demone parte automaticamente ad ogni login grazie a
-`~/.config/autostart/stenografa.desktop` (se non lo vuoi, cancella quel
-file). È già stato avviato anche per la sessione corrente.
-
-## Configurare la scorciatoia da tastiera (GNOME)
-
-1. Apri **Impostazioni > Tastiera > Scorciatoie personalizzate** (in GNOME 4x
-   /50: Impostazioni > Tastiera, poi "Scorciatoie da tastiera" in fondo >
-   "Scorciatoie personalizzate" > "+").
-2. Nome: `Stenografa toggle`.
-3. Comando: `/home/oberon/Documents/Development/stenografa/toggle.py`
-4. Assegna la combinazione che preferisci (es. `Super+Spazio` o `Ctrl+Alt+R`).
-
-Da quel momento premi la scorciatoia per iniziare a registrare, la premi di
-nuovo per fermare: il testo trascritto finisce negli appunti (`Ctrl+V` per
-incollarlo) e appare una notifica con l'anteprima.
-
-## Uso manuale (senza scorciatoia)
-
-```bash
-# avvia il demone (se non già in esecuzione)
-./daemon.py &
-
-# avvia/ferma la registrazione
-./toggle.py
+```
+ microphone ─▶ daemon.py ─▶ faster-whisper (GPU, medium/int8-float16)
+                  │               │  VAD strips silence before transcribing
+                  │               ▼
+                  │         clipboard (wl-copy)
+                  │               │
+                  │               ▼
+                  │         auto-paste into the focused window
+                  │         (Ctrl+Shift+V in terminals) + desktop notification
+                  │
+ phone app (Flutter) ◀── TCP :8765, optional TLS ──▶ the same daemon
+ MCP client ◀── stdio ──▶ mcp_server.py ── unix socket ──▶ daemon
 ```
 
-Il demone impedisce a se stesso di partire due volte (lock su
-`$XDG_RUNTIME_DIR/stenografa.lock`): se lo lanci mentre è già in esecuzione,
-stampa un errore ed esce subito invece di aprire una seconda porta/socket in
-conflitto con la prima istanza.
+The daemon is headless: feedback comes from desktop notifications and the phone
+app. An optional GNOME Shell extension draws a non-intrusive "recording" pill
+on screen while the microphone is open.
 
-## Configurazione (lingua, traduzione, ripristino appunti)
+## Highlights
 
-`~/.config/stenografa/config.json` contiene, oltre al token dell'app
-telefono, alcune impostazioni modificabili anche a caldo (dalle
-impostazioni dell'app telefono o via MCP, senza riavviare il demone):
+- **Toggle dictation** from a GNOME keyboard shortcut, the phone, or by voice.
+  The transcript goes to the clipboard and is pasted automatically — with
+  `Ctrl+Shift+V` instead of `Ctrl+V` when the focused window is a terminal.
+- **GPU-friendly**: the model loads into VRAM *while you are already speaking*
+  and unloads after 5 minutes of idleness. If the GPU is busy or absent it
+  falls back to the CPU automatically and says so with a notification.
+- **Voice activation** ("jarvis" / "jarvis stop", fully user-configurable) via
+  a tiny CPU-resident Whisper listener that never touches VRAM.
+- **AI voice commands**: dictate "copy" and the configured LLM turns it into
+  `ctrl+c`. Ambiguous commands open a choice panel on the phone instead of
+  guessing; the interpreter can also launch apps and compose multi-step
+  macros, always scoped to the app each dashboard is about.
+- **Phone dashboards**: a fully editable grid of buttons — shortcuts, macros,
+  text snippets, app launchers, mic, AI command — with push-to-talk, dictation
+  history, per-app auto-switching and phone-side wake-word listening.
+- **MCP server**: an MCP client (Claude Code, Claude Desktop, …) can compose
+  dashboards and change settings from natural-language requests.
+- **Private by construction**: dictation history lives in memory only, TLS
+  with certificate pinning is one switch away, and neither the phone nor the
+  LLM can ever make the daemon execute something arbitrary.
 
-- **Lingua di dettatura** (`language`): un codice ISO 639-1 (`it`, `en`, ...)
-  o `"auto"` per il rilevamento automatico. Whisper supporta quasi 100
-  lingue; l'elenco mostrato nell'app/nel tool MCP (`SUPPORTED_LANGUAGES` in
-  `daemon.py`) e' solo una selezione curata delle piu' comuni, non esaustiva.
-- **Ripristina clipboard** (`restore_clipboard`, spento di default): se
-  attivo, il contenuto degli appunti da prima della dettatura viene
-  ripristinato subito dopo l'incolla automatico, cosi' non perdi quello che
-  avevi copiato in precedenza. Il ripristino avviene **solo se l'incolla
-  automatico e' riuscito**: se fallisce, il testo dettato resta negli appunti
-  come alternativa per un Ctrl+V manuale.
-- **Metti in pausa i video mentre detto** (`pause_media_while_recording`,
-  spento di default): all'inizio della registrazione il demone mette in
-  pausa i riproduttori in corso sul PC e li fa ripartire alla fine, cosi'
-  il loro audio non finisce nella trascrizione. Quello che i player non
-  espongono (piu' schede dello stesso browser che suonano insieme) viene
-  silenziato via PipeWire e riattivato dopo. Vedi "Controlli dei video".
-- **Traduzione automatica** (`translate_enabled`, spenta di default;
-  `translate_target`; `translate_engine`): traduce il testo dettato con un
-  pulsante microfono normale (`kind: "record"`, non si applica ad
-  "ai_command") prima di incollarlo. Due motori possibili:
-  - `translate_engine: "whisper"` — usa il task nativo "translate" del
-    modello Whisper: veloce, non richiede LM Studio, ma **puo' tradurre solo
-    verso l'inglese** (limite del modello, non del demone). Valido solo se
-    `translate_target` e' `"en"`.
-  - `translate_engine: "llm"` — passa il testo gia' trascritto fedelmente a
-    LM Studio (stesso motore del comando vocale IA) perche' lo traduca in
-    `translate_target`, che puo' essere una lingua qualsiasi (non solo
-    inglese). Un po' piu' lento (richiede LM Studio avviato con un modello
-    caricato).
-  Se `translate_target` non e' `"en"`, l'engine "llm" viene sempre usato
-  anche se e' salvato "whisper": Whisper da solo non puo' tradurre verso
-  altre lingue.
-- **Vocabolario di dettatura** (`vocabulary`, vuoto di default): elenco di
-  termini (nomi propri, gergo tecnico, nomi di prodotto) passato a Whisper
-  come `initial_prompt`, cioe' come se fosse il testo immediatamente
-  precedente a quello da trascrivere: il modello lo usa come contesto e
-  tende a preferire quelle grafie. E' un suggerimento, non un vincolo, e
-  liste troppo lunghe peggiorano la trascrizione invece di migliorarla (da
-  qui il limite di 800 caratteri): mettici solo i termini che vengono
-  davvero sbagliati. Ogni dashboard puo' averne uno proprio (vedi
-  "Vocabolario per dashboard" sotto), che si somma a questo.
-- **Conferma prima di incollare** (`confirm_before_paste`, spenta di
-  default): se attiva, il testo dettato non viene incollato subito ma
-  compare sul telefono in un pannello dove puo' essere riletto, corretto e
-  approvato — oppure annullato. Se non rispondi entro qualche minuto la
-  richiesta scade da sola senza incollare nulla (il testo resta comunque
-  nello storico). Utile per dettature lunghe o da verificare; di troppo per
-  la dettatura rapida, dove aggiungerebbe un tocco ad ogni frase. Non si
-  applica ai pulsanti "ai_command", che non incollano testo.
-- **Richiedi TLS** (`require_tls`, spento di default): rifiuta le
-  connessioni in chiaro dal telefono. Vedi "Cifratura del canale" sotto.
+## Repository layout
 
-## Riavviare il demone dal telefono
+| File | What it is |
+|---|---|
+| `daemon.py` | The headless daemon: recording, transcription, pasting, TCP server for the phone app, local control socket, wake-word listener, AI-command engine, media controls. |
+| `platform_backend.py` | OS abstraction layer (audio, clipboard, key simulation, notifications, focused-window detection, app enumeration) behind a common `Backend` interface. Linux implemented and verified; Windows/macOS written but untested. |
+| `llm_provider.py` | Swappable LLM backends — LM Studio, Ollama, OpenAI, Anthropic, Claude Code CLI — shared by AI voice commands and translation. |
+| `mcp_server.py` | MCP (stdio) server exposing dashboard management and daemon settings as tools. |
+| `setup_llm.py` | Interactive setup and verification of the LLM backend (`~/.config/stenografa/llm.json`). |
+| `key_combo.py` | Cross-platform parsing/validation of key combos (`ctrl+c`, `alt+tab`, …). |
+| `toggle.py` | Tiny client that starts/stops dictation over the daemon's unix socket — bind it to a keyboard shortcut. |
+| `tests/` | pytest suite over the daemon's pure logic (layout validation, config, AI commands, TLS detection, wake word, …) using fake backends — no audio/GPU/network required. |
 
-Nelle impostazioni dell'app (sotto le altre opzioni, solo quando connessa)
-c'e' un pulsante "Riavvia demone" (con conferma, per evitare tocchi
-accidentali): rilancia lo stesso processo Python (stesso PID, via
-`os.execv`) rileggendo il codice di `daemon.py` da disco, utile dopo un
-aggiornamento del demone senza dover usare un terminale sul PC. Layout e
-configurazione non vengono persi (restano su disco); la connessione si
-interrompe per qualche secondo e l'app si riconnette da sola. Disponibile
-anche via MCP (`restart_daemon`).
+The phone app, **[RecordAndPaste](https://github.com/ghirardo-giorgio/RecordAndPaste)**
+(Flutter), lives in its own repository and connects to the daemon over TCP
+port 8765.
 
-## App telefono (RecordAndPaste)
+## Requirements (Linux)
 
-L'app Flutter in `/home/oberon/Documents/Development/Flutter/RecordAndPaste`
-si collega al demone via TCP (porta 8765) sulla stessa rete WiFi. Nelle
-impostazioni dell'app va inserito l'IP del PC, la porta e il token letto da
-`~/.config/stenografa/config.json` (rigenerato cancellando quel file e
-riavviando il demone). L'interfaccia dell'app è disponibile in italiano e
-inglese (impostazione "Lingua interfaccia" nelle impostazioni, separata dalla
-lingua di dettatura).
+- Python **3.10+** (developed and tested on 3.12).
+- System commands (package names from Debian/Ubuntu — adjust for your distro):
 
-L'interfaccia e' composta da una o piu' **dashboard**, tra cui si passa con
-uno swipe orizzontale (indicatore a puntini e nome in alto). Ogni dashboard
-ha una propria griglia di pulsanti (righe x colonne). Esistono sette tipi
-di pulsante:
+  | Command | Package | Used for |
+  |---|---|---|
+  | `pw-record` | pipewire | microphone capture (mono, 16 kHz) |
+  | `wl-copy`, `wl-paste` | wl-clipboard | clipboard |
+  | `ydotool`, `ydotoold` | ydotool | key simulation — the daemon spawns its own private `ydotoold` instance, but the user needs write access to `/dev/uinput` (typically the `input` group) |
+  | `notify-send` | libnotify-bin | desktop notifications |
+  | `gdbus`, `gio` | libglib2.0-bin | MPRIS media players, focused-window detection (GNOME D-Bus), app launching |
+  | `pactl` | pulseaudio-utils | per-stream muting of unpausable players (works against PipeWire) |
+  | `openssl` | openssl | self-signed TLS certificate generation |
+  | `magick` *(optional)* | imagemagick | SVG→PNG conversion for app icons (skipped gracefully if missing) |
 
-- **microfono** (`kind: "record"`): avvia/ferma la dettatura vocale e incolla
-  il testo trascritto. Tutte le sue istanze condividono la stessa
-  registrazione (non ce n'e' una per dashboard). Deve sempre restarne almeno
-  uno in tutto il layout (l'ultimo non e' rimovibile), ma se ne possono
-  aggiungere altri in qualunque dashboard — utile per dettare senza dover
-  tornare sulla dashboard principale.
-- **comando vocale IA** (`kind: "ai_command"`): stesso funzionamento del
-  microfono, ma invece di incollare il testo dettato lo invia a un modello
-  linguistico locale (LM Studio) che lo traduce in una combinazione di tasti
-  da eseguire — es. dici "copia" e viene eseguito `ctrl+c`. Vedi "Comando
-  vocale IA" sotto. Non protetto: se ne possono avere quanti se ne vuole o
-  nessuno.
-- **scorciatoia** (`kind: "keys"`): simula una combinazione di tasti fissa
-  (es. "copia" -> `ctrl+c`) quando premuto.
-- **macro** (`kind: "macro"`): esegue in sequenza piu' combinazioni di tasti
-  (`combos`, massimo 20) con una pausa configurabile fra l'una e l'altra
-  (`delay_ms`, 120 ms di default) — i flussi che altrimenti richiederebbero
-  tre tocchi separati. Se un passo fallisce la sequenza si interrompe e lo
-  segnala: i passi successivi presuppongono lo stato lasciato dai
-  precedenti, tirare dritto rischierebbe di eseguirli nel contesto
-  sbagliato.
-- **testo** (`kind: "text"`): incolla uno snippet fisso (`text`, massimo
-  5000 caratteri) — prompt ricorrenti, firme, blocchi di codice, percorsi
-  lunghi. Usa la stessa pipeline della dettatura: appunti, incolla adattivo
-  nei terminali e ripristino degli appunti se attivo. Non entra nello
-  storico delle dettature: non e' qualcosa che hai detto, e' qualcosa che
-  hai gia' salvato in un pulsante.
-- **avvia applicazione** (`kind: "launch"`): avvia sul PC l'applicazione
-  indicata da `app_id`, scelta per nome da un elenco (vedi "Avvio
-  applicazioni" sotto). L'id viene validato alla creazione del pulsante e di
-  nuovo ad ogni pressione: se l'app viene disinstallata il pulsante notifica
-  l'errore invece di tentare comunque il lancio.
+- Optional GNOME Shell extensions:
+  - **Window Calls** (`window-calls@domandoman.xyz`) — enables "follow the
+    focused app" dashboard switching and terminal detection for adaptive paste.
+  - **stenografa-overlay** — the companion extension that draws the on-screen
+    recording pill (not included in this repository).
 
-Toccando l'icona a matita in alto a sinistra si entra in modalita' modifica:
+A CUDA-capable NVIDIA GPU is **optional**: without one the daemon falls back to
+the CPU on its own (same model, slower transcription).
 
-- si tocca una cella vuota per creare li' un nuovo pulsante, scegliendo tra
-  "Scorciatoia" (etichetta + combinazione di tasti, es. `ctrl+c`), "Macro"
-  (etichetta + una combinazione per riga + pausa fra i passi), "Testo da
-  incollare" (etichetta + testo), "Avvia applicazione" (etichetta + app
-  scelta da un elenco ricercabile), "Microfono" (solo etichetta, di default
-  "Registra"), "Comando vocale (IA)" (solo etichetta, di default "Comando
-  vocale");
-- si tocca la **X** in alto a destra su un pulsante per rimuoverlo (bloccato
-  solo se e' l'unico pulsante microfono rimasto in tutto il layout);
-- si trascina un punto qualsiasi della cella (non solo un'iconcina) per
-  spostarlo in un'altra cella della stessa dashboard; se la si rilascia
-  sopra una cella gia' occupata, i due pulsanti si scambiano di posto
-  invece di rifiutare lo spostamento;
-- le frecce +/- sotto e a destra della griglia aggiungono/tolgono righe e
-  colonne — il contenuto delle celle si ridimensiona automaticamente se lo
-  spazio verticale/orizzontale disponibile si riduce (es. ruotando il
-  telefono in orizzontale con molte righe), senza andare in overflow;
-- si tocca il nome della dashboard in alto per rinominarla, duplicarla,
-  riordinarla (frecce sinistra/destra tra le dashboard) o eliminarla (non
-  eliminabile se e' l'unica rimasta, o se contiene l'unico pulsante
-  microfono del layout); la duplicazione copia le scorciatoie ma non i
-  pulsanti microfono/IA ne' l'associazione "segue app attiva";
-- con un tocco lungo su una scorciatoia (non su microfono/comando IA/
-  IA, il cui aspetto segue lo stato della registrazione) si apre
-  l'editor di colore/icona (stessa tavolozza/icone che puo' scegliere l'LLM
-  via MCP, vedi sotto);
-- nel dialogo "Impostazioni dashboard" (voce "Impostazioni" toccando il
-  nome) si puo' associare uno o piu' testi (separati da virgola) da cercare
-  nell'app/finestra col focus sul PC (vedi "Dashboard che segue l'app
-  attiva" sotto) e un vocabolario di dettatura specifico (vedi
-  "Vocabolario per dashboard" sotto).
+## Installation
 
-### Tieni premuto per parlare (push-to-talk)
+```bash
+git clone https://github.com/ghirardo-giorgio/stenografa.git
+cd stenografa
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-Nelle impostazioni dell'app, "Tieni premuto per parlare" cambia il
-comportamento dei pulsanti microfono: invece di funzionare da interruttore
-(tocca per iniziare, tocca per fermare) registrano finche' li tieni premuti.
-Evita le registrazioni lasciate aperte per sbaglio, a costo di dover tenere
-il dito sullo schermo durante la dettatura. La pressione e il rilascio
-viaggiano come due comandi separati (`button_down`/`button_up`): il rilascio
-viene inviato anche se il dito esce dalla cella, altrimenti il demone
-resterebbe a registrare. Un secondo "premuto" mentre una registrazione e'
-gia' in corso (es. da un altro telefono collegato) non la riavvia.
+For GPU transcription you need the NVIDIA driver plus a CUDA/cuDNN runtime
+matching your `ctranslate2` build — see the
+[faster-whisper documentation](https://github.com/SYSTRAN/faster-whisper) for
+the exact requirements. Without them everything still works on CPU.
 
-E' un'impostazione locale del telefono, non del demone: telefoni diversi
-collegati allo stesso PC possono usarla o no indipendentemente. La
-modalita' e' sospesa in modifica del layout, dove il tocco serve a
-selezionare e trascinare i pulsanti.
+### First run
 
-**Rete di sicurezza per chi se ne dimentica**: chi non attiva "Tieni
-premuto per parlare" resta in modalita' a interruttore, dove un tocco
-accidentale puo' lasciare la registrazione avviata senza accorgersene. Il
-demone impone comunque un limite massimo di `RECORDING_MAX_DURATION_SECONDS`
-(3 minuti di default, in `daemon.py`): superato, ferma la registrazione da
-solo, trascrive quello che c'e' fino a li' e avvisa con una notifica
-desktop del motivo. Si applica solo alla registrazione "a interruttore"
-(telefono in modalita' normale o scorciatoia da tastiera GNOME): in "tieni
-premuto per parlare" non serve, dato che il rilascio del dito ferma sempre
-tutto da solo, per quanto a lungo resti premuto.
+```bash
+./daemon.py     # starts listening; refuses to start twice (lock file)
+./toggle.py     # starts/stops a dictation
+```
 
-### Vibrazione
+Everything lives under `~/.config/stenografa/`:
 
-Sempre nelle impostazioni dell'app (attiva di default): il telefono vibra
-all'inizio e alla fine della registrazione e quando qualcosa va storto. Il
-riscontro scritto del demone e' una notifica desktop, cioe' proprio dove non
-stai guardando mentre tieni il telefono in mano.
+| File | Purpose |
+|---|---|
+| `config.json` | phone-app token and hot-reloadable settings (language, TLS, wake word, …) |
+| `layout.json` | phone-app dashboards (older single-grid layouts are migrated automatically) |
+| `llm.json` | LLM backend choice and credentials — created by `setup_llm.py`, written with mode 0600 |
+| `cert.pem`, `key.pem` | self-signed TLS certificate, generated on first start |
 
-### Storico delle dettature
+To launch it at login, drop an autostart entry:
 
-L'icona a orologio in alto a sinistra (visibile solo se c'e' qualcosa da
-mostrare) apre le ultime dettature della sessione, dalla piu' recente. Serve
-soprattutto quando l'incolla automatico e' finito nella finestra sbagliata:
-si tocca una voce e il demone la re-incolla nella finestra col focus adesso.
+```ini
+# ~/.config/autostart/stenografa.desktop
+[Desktop Entry]
+Type=Application
+Name=Stenografa
+Exec=/absolute/path/to/stenografa/daemon.py
+X-GNOME-Autostart-enabled=true
+```
 
-Lo storico vive **solo in memoria** sul PC (le ultime
-`HISTORY_MAX_ENTRIES`, 20 di default) e non finisce mai su disco: e' testo
-dettato dall'utente, spesso privato. Si azzera al riavvio del demone. Al
-telefono arrivano solo le anteprime (300 caratteri) e un id: il re-incolla
-avviene per id, quindi il testo integrale non viaggia mai in rete e il
-telefono puo' solo scegliere fra testi che il demone ha gia' prodotto, non
-farne incollare di arbitrari.
+To stop the daemon: `pkill -f daemon.py`, or send `quit` to its control socket.
+(Autostart relaunches it at the next login; the lock file guarantees two
+instances never run together.)
 
-### Scegliere il backend LLM
+### Keyboard shortcut (GNOME)
 
-Le funzioni che usano un modello linguistico — comando vocale IA, traduzione
-con engine `llm` — passano tutte da un unico punto
-(`llm_provider.py`), quindi il backend si sceglie una volta sola e vale per
-tutte e tre. Cinque backend supportati:
+1. **Settings → Keyboard → Custom shortcuts → "+"**
+2. Name: `Stenografa toggle`
+3. Command: `/absolute/path/to/stenografa/toggle.py`
 
-| Backend | Chiave API | Note |
+Press the shortcut to start recording, press it again to stop: the transcript
+lands in the clipboard, gets pasted, and a notification previews it.
+
+## Phone app (RecordAndPaste)
+
+A Flutter app ([separate repository](https://github.com/ghirardo-giorgio/RecordAndPaste))
+that connects to the daemon over your local
+Wi-Fi: enter the PC's IP, the port (8765) and the token from
+`~/.config/stenografa/config.json` (delete the file and restart the daemon to
+regenerate it). The UI is available in Italian and English.
+
+Each dashboard is a button grid; swipe horizontally to switch, or let the phone
+switch on its own when the app a dashboard matches gains focus on the PC
+(requires the Window Calls extension). Seven button kinds:
+
+| Kind | Action |
+|---|---|
+| `record` | Start/stop dictation and paste the transcript. One shared recording across all mic buttons; at least one must always exist. Optional `auto_enter` presses Enter right after pasting — ideal for chats. |
+| `ai_command` | Like `record`, but the transcript is interpreted by the configured LLM into key combos to execute. |
+| `keys` | Simulates one fixed key combo. |
+| `macro` | Runs up to 20 key combos in sequence, with a configurable pause between steps. |
+| `text` | Pastes a fixed snippet (up to 5000 chars) through the same clipboard/paste pipeline. |
+| `launch` | Launches an installed app (picked from a searchable list; the id is re-validated on every press). |
+| `paste_last` | Re-pastes the last dictation — for when the text landed in the wrong window. |
+
+Edit mode (pencil icon): add buttons by tapping empty cells, drag to move or
+swap, long-press to restyle (colors and ~80 Material icons), resize the grid,
+rename/duplicate/reorder/delete dashboards, per-dashboard settings.
+
+Extras: **push-to-talk** (hold to record), **vibration** feedback, session
+**history** (re-paste any recent dictation into the current window),
+**wake-word listening from the phone**, and automatic **on-phone transcription**
+when the PC model falls back to CPU. A recording left open by accident is
+stopped by the daemon after 3 minutes (`RECORDING_MAX_DURATION_SECONDS`), and
+an optional silence timeout closes idle dictations on its own.
+
+## Voice activation
+
+Enabled with `wake_word_enabled`. Two phrases — defaults `jarvis` and
+`jarvis stop` — start and stop dictation without touching anything:
+
+- Recognition runs a second Whisper `tiny` model in int8 **on CPU** (about
+  0.08 s of work per second of listening on the reference machine): it never
+  touches VRAM and cannot interfere with the dictation model or its GPU
+  unload.
+- Phrases are passed to Whisper as an `initial_prompt` — without it, an
+  invented word like "jarvis" gets transcribed as whatever the language
+  suggests and would never match.
+- Matching tolerates transcription errors (up to roughly a quarter of the
+  phrase's letters wrong), and each phrase can list comma-separated variants
+  for how the recognizer actually hears it.
+- The same two phrases can be listened for **from the phone** (independent
+  switch, system speech recognizer, app in foreground) — useful when you are
+  away from the PC's microphone. Both listeners can run at once.
+- The phrases are stripped from the transcript before pasting, and the
+  optional GNOME extension shows a pill while the mic is open — it never takes
+  pointer or keyboard focus, so pasting lands in the right window.
+
+## AI voice commands
+
+Speak into an `ai_command` button and the configured LLM returns the key
+combinations to execute. Design choices that keep it predictable:
+
+- **Ambiguity is never guessed.** If a phrase matches several actions ("copy"
+  → `ctrl+c`, `ctrl+shift+c`, "duplicate"), the daemon proposes the candidates
+  in a panel on the phone; nothing runs until you tap one, and the panel
+  expires after 90 s without doing anything.
+- **Dashboard shortcuts steer the interpreter.** Key-combo buttons in the same
+  dashboard act as vocabulary for that app — dictating "invoke" runs the
+  dashboard's `ctrl+enter` rather than a generic reading. Long shortcut lists
+  can be saved invisibly (`set_dashboard_shortcuts`) so they count for the AI
+  without cluttering the grid.
+- **App launching resolves real apps.** The model names an app; the daemon
+  matches it against the actually-installed ones (the model never sees the
+  list and cannot invent ids). Ambiguous matches go to the choice panel; exact
+  matches win.
+- **Voice-generated macros** handle multi-step tasks, but every step must pass
+  the same validation as a `macro` button and is constrained to the current
+  dashboard's application — one invented keystroke discards the whole macro
+  instead of half-running it.
+- **From a panel on the PC itself** (e.g. a Quickshell widget), the same
+  engine can also propose shell commands — but they are refused unless the
+  panel explicitly confirms (`confirm_shell`), and caps apply (8 commands,
+  500 chars each, 120 s timeout). The user always reads the command before it
+  runs.
+
+## LLM backends
+
+All LLM features (AI voice commands, translation) go through a single provider
+layer. Five backends:
+
+| Backend | API key | Notes |
 |---|---|---|
-| **LM Studio** | no | Locale. Usa il modello gia' caricato (`model: "auto"`). |
-| **Ollama** | no | Locale. Serve un modello scaricato (`ollama pull`). |
-| **OpenAI** | si | Cloud. |
-| **Anthropic (API Claude)** | si | Cloud. Senza chiave esplicita l'SDK usa `ANTHROPIC_API_KEY` o un profilo `ant auth login`. |
-| **Claude Code (CLI)** | no | Usa il CLI gia' autenticato. Nessuna chiave, ma piu' lento (avvia un agente ad ogni chiamata). |
-
-Si configura con lo script interattivo:
+| **LM Studio** | no | Local; uses the already-loaded model (`model: "auto"`). |
+| **Ollama** | no | Local; needs a pulled model (`ollama pull`). |
+| **OpenAI** | yes | Cloud. |
+| **Anthropic** | yes | Cloud; without an explicit key the SDK falls back to `ANTHROPIC_API_KEY` / `ant auth login`. |
+| **Claude Code CLI** | no | Uses the already-authenticated CLI; slower (spawns an agent per call). |
 
 ```bash
-./setup_llm.py            # menu: scegli backend, modello, credenziali
-./setup_llm.py --show     # mostra la configurazione attuale
-./setup_llm.py --check    # prova il backend selezionato
+./setup_llm.py            # interactive menu → ~/.config/stenografa/llm.json
+./setup_llm.py --show     # show the current configuration
+./setup_llm.py --check    # test the selected backend
 ```
 
-Le impostazioni finiscono in `~/.config/stenografa/llm.json` (permessi 0600,
-puo' contenere chiavi API). Il file contiene i parametri di **tutti** i
-backend piu' il campo `provider` che dice quale usare: cambiare backend e' una
-parola sola e le credenziali degli altri restano dove sono. Il demone rilegge
-il file ad ogni chiamata, quindi **il cambio ha effetto subito, senza
-riavviarlo**.
+The file stores the parameters of **all** backends plus a `provider` field:
+switching backend is a one-word edit and takes effect immediately (the daemon
+re-reads the file on every call). Cloud backends can read their key from an
+environment variable (`api_key_env`) instead of disk. Local backends answer in
+a few hundred milliseconds — the right choice for voice commands; cloud
+backends interpret ambiguous commands better.
 
-Le chiavi API si possono tenere fuori dal disco: ogni backend cloud ha un
-campo `api_key_env` con il nome di una variabile d'ambiente, che ha la
-precedenza sul valore salvato nel file.
+## Controlling it with MCP
 
-Aggiungere un backend significa scrivere una sottoclasse di `BaseProvider` in
-`llm_provider.py` e registrarla in `PROVIDERS`, senza toccare `daemon.py`.
-
-**Quale scegliere.** I backend locali rispondono in poche centinaia di
-millisecondi e non mandano nulla fuori dal PC: sono la scelta giusta per il
-comando vocale, dove la latenza si sente ad ogni pressione. I backend cloud
-danno interpretazioni migliori sui comandi ambigui, al prezzo
-della latenza di rete (e, per OpenAI/Anthropic, del consumo di credito).
-Claude Code non richiede credenziali ma paga l'avvio di un agente completo ad
-ogni chiamata, quindi conviene sulle traduzioni piu' che sul comando
-vocale.
-
-### Comando vocale IA
-
-Un pulsante `kind: "ai_command"` invia il testo trascritto al **backend LLM
-configurato** (vedi "Scegliere il backend LLM" sotto), che lo interpreta e
-restituisce la combinazione di tasti da eseguire.
-
-Se il backend non e' raggiungibile, o il comando dettato non corrisponde a
-nessuna combinazione valida, il pulsante non esegue nulla e mostra una
-notifica di errore sul PC — non incolla mai il testo grezzo come fallback,
-per non eseguire scorciatoie a caso.
-
-**Comandi ambigui: scelta sul telefono**: quando la frase dettata puo'
-corrispondere a piu' azioni diverse (es. "copia" fra `ctrl+c`, `ctrl+shift+c`
-e "duplica"), il demone **non indovina e non esegue nulla**: propone i
-candidati e aspetta. Il telefono apre un pannello sopra la dashboard corrente
-con le opzioni come pulsanti a griglia; al tocco viene eseguita quella
-scelta, e il pannello si chiude. Meglio un tocco in piu' che l'esecuzione a
-caso di una scorciatoia potenzialmente distruttiva.
-
-Il pannello e' **effimero**: non crea dashboard, non tocca `layout.json` e
-non c'e' quindi nessuna dashboard da "ripristinare" dopo la scelta. Si chiude
-da solo dopo `AI_COMMAND_CHOICE_TIMEOUT` secondi (90 di default, in
-`daemon.py`) senza eseguire niente, e viene ritirato anche se nel frattempo
-parte una nuova dettatura o se la scelta e' gia' stata fatta da un altro
-telefono collegato. Il demone accetta solo combinazioni fra quelle che ha
-proposto, quindi il pannello non e' una via per fargli eseguire scorciatoie
-arbitrarie.
-
-Quanti candidati proporre lo decide il modello: se il comando e' chiaro ne
-restituisce **uno solo** e viene eseguito subito come prima, senza alcun
-tocco aggiuntivo. Il massimo di opzioni mostrate e' `AI_COMMAND_MAX_OPTIONS`
-(6).
-
-**Priorita' alle scorciatoie della dashboard**: l'interpretazione tiene conto
-di quali pulsanti "scorciatoia" (`kind: "keys"`) esistono nella stessa
-dashboard del pulsante `ai_command` premuto. Es. se la dashboard "Invoke AI"
-contiene un pulsante "Invoca" con combo `ctrl+enter`, dettare "invoca" (anche
-solo per significato, non serve l'uguaglianza testuale esatta) esegue proprio
-quella combinazione invece di un'interpretazione generica. E' quindi utile
-aggiungere in quella dashboard pulsanti "keys" con etichette parlanti anche
-se non li tocchi mai col dito: danno al comando vocale un vocabolario
-preciso per quel contesto.
-
-**Vocabolario di scorciatoie nascoste**: se hai una lista lunga di
-scorciatoie di un'app (es. tutti gli strumenti di Gimp) e vuoi che il
-comando vocale le riconosca tutte senza occupare la griglia con decine di
-pulsanti che non premerai mai col dito, salvale nel campo `shortcuts` della
-dashboard — via MCP `set_dashboard_shortcuts(dashboard_id, shortcuts)`
-(sostituisce l'intera lista, non la somma) o passando `shortcuts` gia' a
-`create_dashboard`. Sono etichetta+combinazione di tasti come i pulsanti
-"keys", ma non compaiono mai sul telefono: contano solo per
-l'interpretazione IA, con la stessa priorita' delle scorciatoie visibili.
-
-**Aprire applicazioni a voce**: oltre alle combinazioni di tasti, il comando
-vocale riconosce le richieste di avviare un'applicazione ("apri gimp",
-"lancia il browser"). Il modello **non riceve mai l'elenco** delle
-applicazioni installate (centinaia di voci) e non puo' inventare un id: si
-limita a nominare un'app, e il demone risolve quel nome contro le
-applicazioni davvero installate. Se corrisponde a piu' d'una (es. "steam"
-fra "Steam" e "Steam Tinker Launch") le propone come opzioni nello stesso
-pannello di scelta dei comandi ambigui; una corrispondenza esatta ha la
-precedenza su quelle parziali, cosi' dire "steam" non chiede una scelta che
-l'utente ha gia' fatto.
-
-**Macro generate a voce**: se il comando descrive un task composto da piu'
-azioni in sequenza ("in gimp crea un nuovo file, aggiungi un livello e
-selezionalo tutto"), il modello puo' generare al volo una **macro** —
-piu' combinazioni di tasti eseguite in ordine, esattamente come un pulsante
-`kind: "macro"` — invece di limitarsi a una singola combinazione.
-
-Questa capacita' e' **vincolata alla dashboard da cui parte il comando**: il
-prompt inviato al modello include il nome della dashboard corrente (es.
-"GIMP") e gli impone esplicitamente che ogni combinazione, singola o dentro
-una macro, deve valere per QUELL'applicazione e nessun'altra — se il task non
-ha senso per quell'app, il modello deve rispondere con un array vuoto. Senza
-una dashboard nota (caso che in pratica non si presenta mai, dato che un
-pulsante `ai_command` vive sempre dentro una dashboard) la capacita' di
-generare macro non viene nemmeno descritta al modello: una macro proposta
-comunque verrebbe scartata, non eseguita.
-
-Ogni combinazione della macro passa la stessa validazione di un pulsante
-`kind: "macro"` (sintassi, massimo `MACRO_MAX_STEPS` passi): se anche una
-sola non e' valida, l'intera macro viene scartata invece di eseguirne solo
-una parte — capita spesso per azioni che in realta' richiedono il mouse (es.
-"impostala di colore rosso" in Gimp non ha una scorciatoia da tastiera: il
-modello a volte inventa un tasto inesistente, che la validazione respinge
-prima di premere qualunque cosa). Se il task e' realmente ambiguo fra piu'
-interpretazioni (comprese macro diverse), vale lo stesso pannello di scelta
-sul telefono descritto sopra.
-
-Mentre l'IA sta interpretando il comando, tutti i pulsanti microfono/IA/
-IA del layout mostrano lo stato "in elaborazione" (viola, icona
-`psychology`): e' uno stato condiviso, dato che la registrazione e' unica
-per tutto il demone.
-
-### Vocabolario per dashboard
-
-Oltre al vocabolario di dettatura globale (vedi "Configurazione" sopra),
-ogni dashboard puo' avere il proprio elenco di termini — il gergo dell'app a
-cui e' dedicata. Quando la dettatura parte da un pulsante di quella
-dashboard, i due si sommano e vengono passati a Whisper come contesto: e' il
-motivo per cui una dashboard "InvokeAI" puo' far trascrivere correttamente
-"denoising" o "checkpoint" senza che quei termini disturbino le dettature
-fatte altrove.
-
-Si imposta dal dialogo "Impostazioni dashboard" sul telefono oppure via MCP
-con `set_dashboard_vocabulary`. Concettualmente e' il gemello del campo
-`shortcuts`: un vocabolario invisibile e specifico per contesto, solo che
-riguarda la trascrizione invece dell'interpretazione IA.
-
-### Dashboard che segue l'app attiva
-
-Toccando l'icona a mirino sotto quella della matita si attiva/disattiva
-"segui app attiva" (spenta di default): quando attiva, il telefono passa da
-solo alla dashboard associata all'applicazione col focus sul PC — es. una
-dashboard "VS Code" con `match = "code"` si apre da sola quando porti in
-primo piano Visual Studio Code. L'associazione si imposta nel dialogo
-"Impostazioni dashboard" (campo "Rileva app") oppure via MCP con
-`set_dashboard_match`. Il testo (o i testi, separati da virgola: es.
-`"code, codium"`) e' cercato (case-insensitive) sia nel nome
-dell'applicazione sia nel titolo della finestra, utile anche per le app web
-riconoscibili solo dal titolo della scheda del browser.
-
-Il rilevamento richiede l'estensione GNOME Shell **Window Calls**
-(`window-calls@domandoman.xyz`) attiva sul PC; se assente o disattivata la
-funzione resta inerte senza generare errori (nessuna dashboard riceve mai
-un suggerimento). Il demone interroga la finestra col focus ogni ~1.5s
-tramite `org.gnome.Shell.Extensions.Windows.List` via D-Bus (solo Linux, vedi
-limiti Windows/macOS sotto).
-
-### Cifratura del canale (TLS)
-
-Il protocollo di rete trasporta tutto il testo dettato e permette di
-simulare tasti sul PC: in chiaro, su una WiFi condivisa, sarebbe leggibile
-(e il token numerico a 5 cifre, comodo ma corto, catturabile) da chiunque
-sia sulla stessa rete. Il rate-limiting sull'autenticazione copre il
-tentativo di forza bruta, non l'ascolto passivo.
-
-Il demone genera quindi con `openssl` un certificato self-signed al primo
-avvio (`~/.config/stenografa/cert.pem` + `key.pem`, quest'ultimo `0600`) e
-accetta connessioni TLS. Non essendoci nessuna autorita' a garantirlo, l'app
-telefono usa il **"trust on first use"**: fissa l'impronta del certificato
-al primo collegamento e da li' in poi rifiuta un certificato diverso,
-mostrando un avviso con l'impronta nuova invece di collegarsi. Il
-certificato viene riusato fra i riavvii: se cambiasse ogni volta, il
-pinning scatterebbe di continuo e finirebbe per addestrare l'utente ad
-accettare qualunque certificato.
-
-**La stessa porta (8765) accetta entrambi i tipi di connessione**: il demone
-riconosce il TLS dal primo byte del pacchetto (un record di handshake TLS
-inizia sempre con `0x16 0x03`, il protocollo in chiaro con la `{` di un
-oggetto JSON) senza consumarlo. Serve a non tagliare fuori una versione
-precedente dell'app durante l'aggiornamento. Quando tutti i telefoni che usi
-sono aggiornati, attiva **"Richiedi collegamento cifrato"**
-(`require_tls`, dalle impostazioni dell'app o via MCP `set_require_tls`): da
-quel momento le connessioni in chiaro vengono rifiutate con un motivo
-esplicito. L'opzione non e' attivabile se il certificato non esiste
-(`openssl` mancante sul PC), altrimenti renderebbe il demone irraggiungibile
-da qualunque telefono senza modo di tornare indietro dall'app.
-
-L'impronta e' SHA-1 e non SHA-256 perche' e' l'unica che `X509Certificate`
-di Dart espone senza dipendenze aggiuntive; per sostituire un certificato
-gia' fissato servirebbe una seconda preimmagine, non una collisione, quindi
-resta adeguata allo scopo. Le impostazioni dell'app mostrano se il canale in
-uso e' cifrato e con quale impronta, da confrontare con quella riportata da
-`get_config` sul PC.
-
-### Invio automatico dopo la dettatura
-
-Un pulsante `kind: "record"` con `auto_enter` acceso preme **Invio** subito
-dopo aver incollato: in una chat il messaggio dettato parte da solo, senza
-toccare la tastiera del PC. Sul telefono si accende e si spegne con la
-spunta sul pulsante stesso, perche' e' una scelta che cambia di continuo —
-in chat serve, in un editor sarebbe un guaio.
-
-Vale solo per la dettatura di quel pulsante: non per il comando vocale IA
-(che non incolla testo), non per il re-incolla di una voce passata e non per
-gli snippet fissi. Con "conferma prima di incollare" attiva, l'Invio parte
-dopo l'approvazione. Fra l'incolla e l'Invio c'e' una breve pausa: certe
-chat web elaborano l'incolla in modo asincrono e un Invio immediato
-partirebbe a campo ancora vuoto.
-
-### Incolla ultimo
-
-Un pulsante `kind: "paste_last"` re-incolla l'ultima dettatura senza
-registrarne una nuova: serve quando il testo e' finito nel posto sbagliato
-perche' il cursore non era dove doveva. Rimetti il cursore a posto, tocchi
-il pulsante e il testo viene incollato di nuovo (stessa pipeline della
-dettatura: appunti, incolla adattivo, ripristino appunti se attivo). Non
-crea una nuova voce nello storico — e' lo stesso testo, non una dettatura
-in piu'. Se non c'e' ancora nulla in memoria (lo storico si azzera al
-riavvio del demone) il pulsante notifica l'errore senza incollare.
-
-### Controlli dei video
-
-Il telefono mostra un pulsante play/pausa per ogni riproduttore attivo sul
-PC, cosi' si ferma un video prima di dettare senza tornare alla tastiera —
-altrimenti il microfono ne capta l'audio. Il rilevamento usa **MPRIS** (lo
-standard D-Bus di browser e riproduttori), interrogato con `gdbus`: nessuna
-dipendenza aggiuntiva. Lo stesso video pubblicato da piu' bus (capita con
-l'integrazione browser di Plasma) viene mostrato una volta sola.
-
-I browser basati su Chromium pubblicano **un solo player per finestra**:
-con due schede che suonano insieme la seconda non e' controllabile. Per
-quel caso l'automatismo `pause_media_while_recording` fa un secondo
-passaggio dai flussi audio di PipeWire (`pactl`), che invece sono uno per
-scheda: quello che non si e' potuto mettere in pausa viene silenziato per
-la durata della dettatura e riattivato alla fine.
-
-Il server audio ricorda il mute **per applicazione**: se un flusso
-silenziato finisce prima del ripristino, l'applicazione resterebbe muta
-anche dopo. Il demone se ne difende riattivando per nome dell'applicazione
-e tenendo d'occhio chi ha silenziato per una ventina di secondi dopo la
-dettatura. Su Windows e macOS il rilevamento non e' implementato: nessun
-pulsante e nessun silenziamento.
-
-### Pulsanti piu' grandi di una cella
-
-`row_span`/`col_span` (default 1) dicono quante celle occupa un pulsante:
-servono a dare rilievo a quelli che si premono piu' spesso. Si impostano
-alla creazione (`add_button`) o dopo (`edit_button`, ed e' cosi' che li
-cambia l'app dal telefono). L'area deve stare dentro la griglia e non
-sovrapporsi ad altri pulsanti; ridurre la griglia con un pulsante esteso
-fuori dai nuovi limiti viene rifiutato, come per un pulsante normale. Nel
-layout salvato i valori pari a 1 non vengono scritti, quindi i layout di
-chi non usa questa funzione restano identici a prima.
-
-### Icone delle applicazioni
-
-Il telefono disegna in filigrana, dietro i pulsanti, l'icona vera
-dell'applicazione a cui la dashboard si riferisce (il suo pulsante "avvia
-applicazione", oppure l'app che corrisponde al suo `match`). Le icone
-arrivano dal PC — su Linux dai file `.desktop` e dai temi installati, con
-gli SVG convertiti in PNG da ImageMagick quando serve; su macOS
-dall'`.icns` del bundle via `sips`; su Windows dall'eseguibile o dagli
-asset del pacchetto via PowerShell — e viaggiano su richiesta
-(`get_app_icon`), con cache da entrambe le parti.
-
-### Avvio applicazioni
-
-Un pulsante `kind: "launch"` avvia un'applicazione installata. In modalita'
-modifica si sceglie da un elenco ricercabile che il telefono chiede al
-demone (`list_apps`): l'id vero (percorso `.desktop` su Linux, `AppID` su
-Windows, bundle `.app` su macOS) non viene mai digitato a mano. Lo stesso
-elenco alimenta il comando vocale IA e i tool MCP `list_launchable_apps`/
-`launch_app`, ed e' tenuto in cache per 15 secondi: enumerarlo costa
-(centinaia di file `.desktop`) e non ha senso rifarlo ad ogni pressione.
-
-Il layout (tutte le dashboard) e' salvato sul PC in
-`~/.config/stenografa/layout.json` e sopravvive a riavvii di demone e
-telefono. I layout creati con una versione precedente di questa app (una
-sola griglia, senza dashboard) vengono migrati automaticamente in un'unica
-dashboard "Stenografa" al primo avvio del demone aggiornato.
-
-## Controllo da MCP
-
-`mcp_server.py` espone la stessa gestione delle dashboard (e alcune
-impostazioni del demone) come server MCP (stdio), cosi' un client MCP (es.
-Claude Code/Claude Desktop) puo' comporle a partire da una richiesta in
-linguaggio naturale ("crea una dashboard con le scorciatoie per InvokeAI").
-Non parla mai col telefono direttamente: passa dal socket di controllo
-locale del demone (`$XDG_RUNTIME_DIR/stenografa-control.sock`, accessibile
-solo dall'utente locale), che a sua volta salva e trasmette il nuovo stato a
-tutti i telefoni connessi.
-
-Tool disponibili:
-
-- `list_dashboards()` — elenco dashboard e pulsanti.
-- `create_dashboard(name, buttons=None, rows=None, cols=None, match=None)` —
-  se richiesta creazione + popolamento in un colpo solo ("crea una dashboard
-  per InvokeAI con i pulsanti Invoca, Annulla..."), passa direttamente
-  `buttons` (stesso schema di `add_buttons`) invece di due chiamate separate
-  (create_dashboard poi add_buttons): operazione atomica, la griglia si
-  auto-dimensiona sui pulsanti se `rows`/`cols` non sono indicati.
-  `remove_dashboard(id)`, `rename_dashboard(id, name)`,
-  `reorder_dashboard(id, position)` (sposta la dashboard in una nuova
-  posizione tra le altre), `duplicate_dashboard(id, name=None)` (copia
-  scorciatoie ma non pulsanti microfono/IA ne' l'associazione "match").
-- `set_dashboard_match(id, match)` — associa la dashboard all'app/finestra
-  da rilevare per lo switch automatico sul telefono (piu' pattern separati
-  da virgola).
-- `set_dashboard_shortcuts(dashboard_id, shortcuts, mode)` — salva un
-  vocabolario di scorciatoie (lista di `{label, combo}`) note al comando
-  vocale IA ma non mostrate come pulsanti. `mode="replace"` (default)
-  sostituisce l'intera lista precedente, `mode="append"` aggiunge tenendo
-  le esistenti (una voce con la stessa etichetta viene aggiornata, non
-  duplicata): comodo per aggiungerne due a una lista di quaranta senza
-  rimandarla tutta.
-- `set_dashboard_vocabulary(dashboard_id, vocabulary)` — termini che Whisper
-  deve trascrivere correttamente quando la dettatura parte da quella
-  dashboard (vedi "Vocabolario per dashboard" sopra).
-- `add_button(dashboard_id, label, row, col, combo, kind, color, icon,
-  combos, delay_ms, text, app_id)` — `kind` e' `"keys"` (default, richiede
-  `combo`), `"macro"` (richiede `combos`, opzionale `delay_ms`), `"text"`
-  (richiede `text`), `"launch"` (richiede `app_id`, da
-  `list_launchable_apps`), `"paste_last"` (re-incolla l'ultima
-  dettatura), `"record"`/`"ai_command"` (pulsanti
-  microfono aggiuntivi, nessun campo in piu').
-- `add_buttons(dashboard_id, buttons)` — aggiunge piu' pulsanti in una sola
-  chiamata atomica, ognuno con lo stesso schema di `add_button`; usalo
-  quando servono piu' pulsanti insieme invece di chiamare `add_button`
-  ripetutamente.
-- `edit_button(id, label, combo, combos, delay_ms, text, app_id)` — cambia
-  etichetta e/o azione di un pulsante esistente senza ricrearlo, quindi
-  senza perderne posizione, colore e icona.
-- `set_button_style(id, color, icon)` — cambia aspetto a un pulsante "keys"
-  esistente (non applicabile a "record"/"ai_command").
-- `remove_button(id)`, `move_button(id, row, col)` (solo entro la stessa
-  dashboard; se la cella e' occupata i due pulsanti si scambiano di posto),
-  `set_grid_size(dashboard_id, rows, cols)`.
-- `get_config()` — lingua di dettatura corrente, stato di "ripristina
-  clipboard" e configurazione della traduzione automatica.
-- `set_language(language)` — cambia la lingua di dettatura (codice ISO
-  639-1 o `"auto"`).
-- `set_pause_media_while_recording(enabled)` — mette in pausa (e silenzia)
-  i video mentre si detta; vedi "Controlli dei video".
-- `set_restore_clipboard(enabled)` — attiva/disattiva il ripristino degli
-  appunti dopo l'incolla automatico.
-- `set_translate_enabled(enabled)`, `set_translate_target(target)` (codice
-  ISO 639-1, mai `"auto"`), `set_translate_engine(engine)` (`"whisper"`,
-  solo verso inglese, o `"llm"`, qualsiasi lingua via LM Studio) — vedi
-  "Configurazione" sopra.
-- `set_vocabulary(vocabulary)`, `set_confirm_before_paste(enabled)`,
-  `set_require_tls(enabled)` — vedi "Configurazione" sopra.
-- `restart_daemon()` — riavvia il demone (stesso processo, stesso PID),
-  utile dopo un aggiornamento del suo codice.
-- `reset_layout()` — azzera tutto a un'unica dashboard col solo pulsante
-  "Registra".
-- `list_launchable_apps()` — elenco delle applicazioni installate sul PC
-  (Linux/macOS/Windows, vedi sotto), ciascuna con un `id` opaco e un `name`
-  leggibile.
-- `launch_app(id)` — avvia l'applicazione con quell'`id` (va sempre ottenuto
-  da una chiamata recente a `list_launchable_apps`, mai inventato o riusato
-  da una sessione precedente: l'elenco puo' cambiare nel frattempo).
-
-`list_launchable_apps`/`launch_app` servono a far avviare un'app al client
-MCP stesso ("apri VSCode") su richiesta in linguaggio naturale; lo stesso
-elenco alimenta i pulsanti `kind: "launch"` e il comando vocale IA (vedi
-"Avvio applicazioni" sopra). L'enumerazione e' cross-platform ma con una
-fonte diversa per OS:
-- **Linux**: parsing dei file `.desktop` (specifica freedesktop.org) in
-  `/usr/share/applications`, `~/.local/share/applications` e le directory
-  equivalenti di Flatpak/Snap, scartando le voci `Type` diverso da
-  `Application` o marcate `NoDisplay`/`Hidden`; il lancio usa `gio launch`
-  (espande correttamente il campo `Exec`, incluse le app sandboxate).
-- **macOS**: bundle `.app` in `/Applications`, `/System/Applications` e
-  `~/Applications`, col nome letto da `CFBundleName` nell'`Info.plist`; il
-  lancio usa `open`.
-- **Windows**: `Get-StartApps` (PowerShell) elenca in un colpo solo sia le
-  voci classiche del menu Start sia le app UWP/Store con un `AppID`
-  univoco; il lancio usa `explorer.exe shell:AppsFolder\<AppID>`. Non
-  testato su una macchina Windows reale, come il resto del backend Windows
-  (vedi "Compatibilità Windows/macOS").
-
-Il demone valida sempre `id` contro l'elenco aggiornato di `list_apps()`
-prima di avviare qualunque cosa (stesso principio delle scorciatoie
-`ai_command`: il client MCP puo' solo *selezionare* un'app da un elenco
-noto, mai eseguire un id/percorso arbitrario) — se l'app non compare piu'
-(es. disinstallata) `launch_app` fallisce con un errore esplicito invece di
-tentare comunque il lancio.
-
-Le combinazioni di tasti supportate sono nomi comuni separati da `+` (es.
-`ctrl+c`, `ctrl+shift+z`, `alt+tab`, `f5`, `pageup`/`pagedown`, `plus`/
-`minus` per lo zoom es. `ctrl+plus`/`ctrl+minus` — "+"/"-" non possono
-essere token letterali perche' "+" e' anche il separatore, "plus"/"minus"
-e' la stessa forma a parola usata dalle stringhe acceleratore di GTK).
-Sinonimi comuni generati spesso da un LLM vengono normalizzati invece che
-rifiutati: `page_up`/`page_down`/`pgup`/`pgdn` per `pageup`/`pagedown`,
-`arrow_up`/`arrow_down`/`arrow_left`/`arrow_right` (come in JS "ArrowLeft")
-per `up`/`down`/`left`/`right`, `-` per `minus`. I pulsanti "record"/
-"ai_command" non sono mai
-restilizzabili (il loro aspetto segue lo stato della registrazione), e non
-si puo' rimuovere l'ultimo pulsante "record" del layout ne' la dashboard
-che lo contiene se e' l'unica ad averne uno (i pulsanti "ai_command" non
-hanno questa protezione: non sono l'unico modo di avviare una
-registrazione).
-
-In `add_buttons`, `create_dashboard` e `set_dashboard_shortcuts`, se piu' di
-un elemento della lista non e' valido l'errore li elenca tutti insieme (non
-solo il primo trovato): utile su liste lunghe (es. tutte le scorciatoie di
-un'app), dove correggerle una alla volta a chiamate successive sarebbe
-inutilmente lento.
-
-`color` (formato `#RRGGBB`) e `icon` (uno di un set fisso di ~80 nomi Material
-Design — incluse icone per strumenti di disegno/fotoritocco tipo Gimp/
-InvokeAI, elencati nel docstring di `add_button`) sono opzionali: l'LLM li
-sceglie in base al tipo di azione (es. rosso + icona cestino per un comando
-distruttivo, verde per conferma/avvio) cosi' l'utente riconosce a colpo
-d'occhio le scorciatoie. Senza specificarli il pulsante usa un aspetto
-neutro di default. In `add_button`/`add_buttons`/`create_dashboard` un nome
-icona non riconosciuto (l'LLM ne inventa a volte uno plausibile ma
-inesistente) non fa fallire la creazione: viene semplicemente ignorato e il
-pulsante usa l'icona di default, cosi' un batch di piu' pulsanti non viene
-scartato per intero per un solo nome sbagliato. Solo `set_button_style`
-(modifica mirata a un pulsante gia' esistente) resta strict e segnala
-l'errore.
-
-Per registrarlo in Claude Code:
+`mcp_server.py` is an MCP stdio server exposing around thirty tools for
+dashboard management and daemon settings, so an MCP client can do everything
+from natural language ("create a dashboard with the InvokeAI shortcuts"). It
+never talks to the phone directly: it goes through the daemon's user-only
+control socket, and changes propagate live to connected phones.
 
 ```bash
-claude mcp add stenografa -- /home/oberon/.pyenv/shims/python3 \
-  /home/oberon/Documents/Development/stenografa/mcp_server.py
+claude mcp add stenografa -- python3 /absolute/path/to/stenografa/mcp_server.py
 ```
 
-Oppure aggiungendo a mano la voce in `.mcp.json` / config del client MCP:
+Tool groups:
 
-```json
-{
-  "mcpServers": {
-    "stenografa": {
-      "command": "/home/oberon/.pyenv/shims/python3",
-      "args": ["/home/oberon/Documents/Development/stenografa/mcp_server.py"]
-    }
-  }
-}
-```
+- **Dashboards**: `list_dashboards`, `create_dashboard` (atomic create +
+  populate), `duplicate_dashboard`, `rename_dashboard`, `reorder_dashboard`,
+  `remove_dashboard`, `set_grid_size`, `reset_layout`.
+- **Buttons**: `add_button`, `add_buttons` (atomic batch), `edit_button`,
+  `set_button_style`, `move_button`, `remove_button`.
+- **Per-dashboard context**: `set_dashboard_match` (follow-the-focused-app
+  patterns), `set_dashboard_shortcuts` (hidden AI-command vocabulary),
+  `set_dashboard_vocabulary` (per-dashboard dictation vocabulary).
+- **Settings**: `get_config`, `set_language`, `set_translate_enabled/target/engine`,
+  `set_vocabulary`, `set_confirm_before_paste`, `set_require_tls`,
+  `set_wake_word_enabled`, `set_wake_phrase_start/stop`, `set_notifications`,
+  `set_pause_media_while_recording`, `set_restore_clipboard`,
+  `set_silence_timeout`.
+- **Apps**: `list_launchable_apps`, `launch_app` — every id is validated
+  against the freshly enumerated list of installed apps, so an MCP client can
+  only *select* an app, never run an arbitrary path or command.
+- **Maintenance**: `restart_daemon` (same process, re-exec).
 
-## Compatibilità Windows/macOS
+The docstrings in `mcp_server.py` are the complete reference for every
+parameter and constraint.
 
-Le operazioni specifiche del sistema operativo (audio, appunti, simulazione
-tasti, notifiche, rilevamento finestra attiva) sono isolate in
-`platform_backend.py` dietro un'interfaccia comune (`Backend`), cosi'
-`daemon.py` resta identico su tutti i sistemi operativi.
+## Configuration reference
 
-| | Linux | Windows | macOS |
-|---|---|---|---|
-| Stato | implementato e verificato (unico ambiente testato finora) | scritto, **mai testato** su una macchina reale | scritto, **mai testato** su una macchina reale |
-| Audio | `pw-record` (PipeWire) | `sounddevice`/`soundfile` | `sounddevice`/`soundfile` |
-| Appunti | `wl-copy`/`wl-paste` | `pyperclip` | `pyperclip` |
-| Simulazione tasti | `ydotool`/`ydotoold` | `pynput` | `pynput` |
-| Notifiche | `notify-send` | `plyer` | `plyer` (fallback `osascript`) |
-| Finestra col focus | estensione GNOME Shell "Window Calls" via D-Bus | `pywin32` + `psutil` | `AppKit.NSWorkspace` (solo nome app, non titolo finestra) |
-| Elenco/avvio app | file `.desktop` + `gio launch` | `Get-StartApps` (PowerShell) + `explorer.exe shell:AppsFolder\` | bundle `.app` + `open` |
-| Dipendenze extra | nessuna oltre a quelle gia' installate | `requirements-windows.txt` | `requirements-macos.txt` |
+Every key below lives in `config.json` and is hot-reloadable — from the phone
+app's settings or via MCP, with no daemon restart:
 
-Limiti noti da verificare quando si prova su Windows/macOS:
+| Key | Default | Meaning |
+|---|---|---|
+| `language` | `it` | Dictation language: ISO 639-1 code or `auto` (Whisper supports ~100 languages). |
+| `restore_clipboard` | off | Restore the pre-dictation clipboard right after the auto-paste (only if the paste succeeded). |
+| `pause_media_while_recording` | off | Pause MPRIS players during dictation and mute whatever cannot be paused (PipeWire), unmute afterwards. |
+| `notifications` | `all` | Desktop notification level: `all`, `errors`, or `none` (the phone always receives full state either way). |
+| `translate_enabled` / `translate_target` / `translate_engine` | off | Translate before pasting. Engine `whisper` translates to English only; engine `llm` goes through the LLM backend and supports any target language. |
+| `vocabulary` | empty | Dictation vocabulary (names, jargon) passed to Whisper as `initial_prompt`; per-dashboard vocabularies add on top. Max 800 chars — a hint, not a constraint. |
+| `confirm_before_paste` | off | Show the transcript on the phone for review/approval before pasting. |
+| `require_tls` | off | Reject cleartext connections from phones (enable once all your phones support TLS). |
+| `silence_timeout` | 10 | Seconds of silence before a toggle-mode dictation closes itself (0 = off, 3–120 allowed). Never applies to push-to-talk. |
+| `wake_word_enabled` / `wake_phrase_start` / `wake_phrase_stop` | off / `jarvis` / `jarvis stop` | Voice activation; phrases can list comma-separated variants, minimum 3 characters. |
 
-- **macOS** richiede che l'utente conceda manualmente il permesso
-  "Accessibilita'" all'interprete Python in Impostazioni di Sistema >
-  Privacy e Sicurezza, altrimenti la simulazione dei tasti fallisce
-  silenziosamente (non e' un permesso concedibile da codice). Il rilevamento
-  della finestra col focus usa solo il nome dell'applicazione in primo piano
-  (non il titolo finestra/scheda), perche' leggere il titolo richiederebbe lo
-  stesso permesso tramite le API AXUIElement.
-- **Windows**: nessun problema di permessi noto a priori, ma la
-  combinazione pynput + focus tramite `GetForegroundWindow` non e' mai stata
-  verificata in pratica. `explorer.exe shell:AppsFolder\<AppID>` (usato da
-  `launch_app`) restituisce spesso un codice di uscita 1 anche quando il
-  lancio riesce: il codice di ritorno non e' considerato affidabile e
-  `launch_app` ritorna `True` semplicemente se il processo parte senza
-  eccezioni — da verificare che non nasconda mai un fallimento reale.
-  Richiede inoltre il **Microsoft Visual C++ Redistributable x64** installato
-  a livello di sistema (non installabile via pip): senza, l'import di
-  `faster_whisper` fallisce con `FileNotFoundError` su `ctranslate2.dll`
-  (mancano `vcruntime140.dll`/`vcruntime140_1.dll`/`msvcp140.dll`).
-  `winget install --id Microsoft.VCRedist.2015+.x64 -e`
-- Su entrambi, testare tramite Wine/Lutris non e' affidabile per verificare
-  incolla-in-altre-app e notifiche reali: serve una macchina Windows/macOS
-  reale (o una VM con VirtualBox per Windows; non esiste virtualizzazione
-  macOS su hardware non Apple).
+## GPU, VRAM and CPU fallback
 
-## Robustezza
-
-- **Istanza singola**: lock su `$XDG_RUNTIME_DIR/stenografa.lock`, vedi
-  sopra.
-- **Rate-limiting sull'autenticazione remota**: il token numerico a 5 cifre
-  (comodo da digitare a mano, ma debole) e' protetto da un limite di 5
-  tentativi falliti per indirizzo IP ogni 60 secondi. Contro l'ascolto
-  passivo sulla stessa rete serve invece TLS: vedi "Cifratura del canale"
-  sopra.
-- **Vocabolari chiusi**: in nessun punto il telefono o l'LLM possono far
-  eseguire al demone qualcosa di arbitrario. Il pannello di scelta accetta
-  solo le opzioni che il demone stesso ha proposto; `launch_app` e i
-  pulsanti di avvio validano l'id contro l'elenco aggiornato delle app
-  installate; il comando vocale puo' nominare un'app ma non costruirne
-  l'id; il re-incolla dello storico avviene per id, non per testo.
-- **Test automatici**: `tests/` (pytest) copre la validazione del layout e
-  dei tipi di pulsante, la configurazione (lingua, vocabolario, ripristino
-  appunti), il comando vocale IA (combinazioni e avvio app), lo storico, la
-  conferma dell'incolla e il riconoscimento TLS/chiaro, usando backend finti
-  — non serve audio/GPU/rete reali per lanciarli:
-
-  ```bash
-  cd /home/oberon/Documents/Development/stenografa
-  python3 -m pytest
-  ```
-
-## Accelerazione GPU e uso della VRAM
-
-La trascrizione gira su CUDA tramite `faster-whisper` (CTranslate2), con il
-modello quantizzato `int8_float16`. Misure reali su RTX 4060 Ti:
+Measured on an RTX 4060 Ti with the `medium` model, `int8_float16`:
 
 | | |
 |---|---|
-| VRAM occupata dal modello `medium` | ~1.0 GB (picco ~1.1 GB in trascrizione) |
-| Caricamento in VRAM | ~4 s, ma avviene **mentre stai già parlando** |
-| Trascrizione di 5 s di audio | ~0.3-0.6 s |
+| VRAM for the model | ~1.0 GB (peak ~1.1 GB while transcribing) |
+| Model load into VRAM | ~4 s — **while you are already speaking** |
+| Transcribing 5 s of audio | ~0.3–0.6 s |
 
-Due accorgimenti tengono bassa l'impronta sulla GPU:
+- **Lazy load**: VRAM stays free until you actually dictate; the model loads
+  in parallel with the recording start.
+- **Auto-unload**: after `MODEL_IDLE_TIMEOUT` (300 s) of inactivity the model
+  leaves VRAM (~100 MB of CUDA context remain while the daemon lives).
+- **Automatic CPU fallback**: if loading on GPU fails — no card, missing
+  driver, or VRAM occupied by a game or another model — the same model runs on
+  CPU (`int8`) and a notification explains why dictation just got slower. The
+  next idle-unload retries the GPU, in case VRAM freed up meanwhile. The
+  active device is reported as `model_device` by `get_config`.
+- **Phone transcription fallback**: when the model runs on CPU, the phone app
+  notices and dictates with the Android system recognizer instead — instant
+  text, at the cost of weaker punctuation and no custom vocabulary, with the
+  app in the foreground.
+- Tunables at the top of `daemon.py`: `MODEL_NAME` (`small` ≈ 0.5 GB, `base`
+  ≈ 0.3 GB, `large-v3` ≈ 3 GB), `MODEL_IDLE_TIMEOUT`,
+  `MODEL_DEVICE`/`MODEL_COMPUTE_TYPE` (e.g. `cpu` + `int8` to force CPU), and
+  the `MODEL_FALLBACK_*` family.
 
-- **Caricamento posticipato**: finché non detti nulla, la VRAM è libera. Il
-  modello si carica all'inizio della registrazione, in parallelo, quindi
-  all'atto pratico non aspetti.
-- **Scarico automatico**: dopo 5 minuti di inattività il modello viene tolto
-  dalla VRAM (restano ~100 MB di contesto CUDA finché il demone è vivo).
+## Platform support
 
-Per regolare il compromesso, modifica in cima a `daemon.py`:
+OS-specific operations are isolated in `platform_backend.py` behind a common
+interface, so `daemon.py` is identical everywhere.
 
-- `MODEL_NAME` — `small` (~0.5 GB) o `base` (~0.3 GB) per occupare meno,
-  `large-v3` (~3 GB) per la massima precisione.
-- `MODEL_IDLE_TIMEOUT` — secondi prima dello scarico; abbassalo se vuoi la
-  GPU libera più in fretta, alzalo se detti spesso.
-- `MODEL_DEVICE` — metti `"cpu"` (con `MODEL_COMPUTE_TYPE = "int8"`) per
-  tornare al funzionamento senza GPU.
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| Status | implemented and verified (the only tested environment) | written, **never tested** | written, **never tested** |
+| Audio | `pw-record` (PipeWire) | sounddevice / soundfile | sounddevice / soundfile |
+| Clipboard | `wl-copy` / `wl-paste` | pyperclip | pyperclip |
+| Key simulation | `ydotool` / `ydotoold` | pynput | pynput (+ manual Accessibility permission) |
+| Notifications | `notify-send` | plyer | plyer (fallback `osascript`) |
+| Focused window | GNOME "Window Calls" via D-Bus | pywin32 + psutil | AppKit (app name only, not window title) |
+| App list / launch | `.desktop` files + `gio launch` | PowerShell `Get-StartApps` + `explorer.exe shell:AppsFolder\` | `.app` bundles + `open` |
+| Media pause/mute | MPRIS + PipeWire per-stream mute | not implemented | not implemented |
+| Extra Python deps | none | `requirements-windows.txt` (+ system VC++ redistributable for ctranslate2) | `requirements-macos.txt` |
 
-## Note
+Known Windows/macOS caveats, to verify on first contact with a real machine:
+macOS silently fails key simulation until you grant the Python interpreter the
+**Accessibility** permission manually; on Windows, `launch_app` treats
+`explorer.exe` exit codes as unreliable (documented in the code), and the
+on-screen recording pill does not exist outside GNOME/Wayland.
 
-- Il demone non ha interfaccia grafica: tutto il riscontro passa da notifiche
-  desktop (`notify-send` su Linux) e dallo stato mostrato nell'app telefono.
-- Il filtro VAD scarta il silenzio prima della trascrizione: evita le
-  allucinazioni tipiche di Whisper sulle pause (se non parli, ricevi
-  "Nessun testo rilevato" invece di una frase inventata).
-- **Incolla adattivo nei terminali**: nella maggior parte degli emulatori di
-  terminale (GNOME Terminal, Konsole, xterm, kitty, Windows Terminal/cmd/
-  PowerShell, Terminal.app/iTerm...) Ctrl+V non incolla — e' spesso un
-  carattere di controllo o semplicemente non mappato. Se la finestra col
-  focus al momento dell'incolla automatico sembra un terminale (in base al
-  nome dell'applicazione, non al titolo — per evitare falsi positivi da
-  testo a caso nel titolo), il demone usa Ctrl+Shift+V al suo posto, sia
-  per il testo dettato che per quello tradotto. Richiede lo stesso
-  rilevamento della finestra attiva usato per "segui app attiva" (su Linux,
-  l'estensione GNOME Shell "Window Calls"); se non disponibile, ricade
-  sempre su Ctrl+V.
-- Se cambi microfono o hai più dispositivi audio, `pw-record` usa la
-  sorgente predefinita di PipeWire (quella impostata nelle Impostazioni
-  audio di GNOME).
-- Per fermare il demone: `./toggle.py` non basta, usa `pkill -f daemon.py`
-  (o trova il PID esatto con `pgrep -af daemon.py`: il pattern deve
-  corrispondere alla riga di comando esatta con cui e' stato lanciato,
-  relativa o assoluta) oppure invia `quit` al socket. Attenzione:
-  `~/.config/autostart/stenografa.desktop` lo rilancia al prossimo login (e
-  puo' gia' essere stato rilanciato da GNOME se il demone era stato avviato
-  a login e poi terminato manualmente durante la sessione) — il lock su
-  `stenografa.lock` evita comunque che due istanze girino insieme in
-  conflitto.
+## Security and privacy
+
+- Phone authentication uses a 5-digit numeric token (easy to type by hand),
+  protected by rate limiting: 5 failed attempts per IP every 60 seconds.
+- **TLS on the same port**: the daemon generates a self-signed certificate on
+  first start (via `openssl`) and serves both cleartext and TLS on port 8765,
+  distinguishing them from the first bytes of each connection. The phone pins
+  the certificate fingerprint on first connect (trust on first use) and
+  refuses any later change. Once every phone is updated, enable
+  `require_tls` to reject cleartext.
+- **Dictation history never touches disk**: the last 20 dictations live in
+  RAM only and are wiped on daemon restart. The phone receives 300-character
+  previews and re-pastes by id, so the full text never travels the network.
+- **Closed vocabularies everywhere**: the AI-choice panel accepts only options
+  the daemon itself proposed; `launch_app` validates ids against the current
+  app list; the LLM can name apps but never construct ids; shell commands from
+  the PC panel require an explicit `confirm_shell` and are bounded (count,
+  length, timeout).
+- `llm.json` is written with mode 0600, and `api_key_env` keeps API keys out
+  of the config file entirely.
+
+## Tests
+
+```bash
+python3 -m pytest
+```
+
+The suite exercises pure logic with fake audio/GPU/network backends: layout
+and button-kind validation, per-dashboard settings migration, config handling
+(language, vocabulary, clipboard restore), AI voice commands (combos, app
+launching, macros), phone-side transcription, silence timeout, wake-word
+matching, TLS-vs-cleartext protocol detection, notifications, history
+re-paste, and more.
+
+## Documentation
+
+- **`mcp_server.py` docstrings** — exhaustive reference for every MCP tool
+  (parameters, constraints, validation rules).
+
+## Project status
+
+- **Linux**: the reference platform — implemented, verified, in daily use.
+- **Windows / macOS**: backends written against the documented APIs but never
+  exercised on real machines; expect fixes on first contact. Testing through
+  Wine/Lutris is not reliable for cross-app pasting and notifications — a real
+  machine (or a Windows VM) is needed. There is no macOS virtualization on
+  non-Apple hardware.
+- **License**: [MIT](LICENSE) — © 2025 Giorgio Ghirardo.

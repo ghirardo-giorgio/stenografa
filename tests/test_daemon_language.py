@@ -54,6 +54,12 @@ def test_config_snapshot_reflects_current_language(daemon_app):
         "confirm_before_paste": False,
         "require_tls": False,
         "pause_media_while_recording": False,
+        "notifications": "all",
+        "wake_word_enabled": False,
+        "wake_phrase_start": daemon.WAKE_PHRASE_START_DEFAULT,
+        "wake_phrase_stop": daemon.WAKE_PHRASE_STOP_DEFAULT,
+        "silence_timeout": daemon.SILENCE_TIMEOUT_DEFAULT,
+        "model_device": daemon.MODEL_DEVICE,
         "tls_available": False,
         "tls_fingerprint": None,
     }

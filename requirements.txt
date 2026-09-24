@@ -1,0 +1,34 @@
+# Stenografa — base dependencies.
+#
+# This file targets the Linux backend, the reference platform. Windows and
+# macOS need additional packages on top of it: see requirements-windows.txt
+# and requirements-macos.txt.
+#
+# Developed and tested with Python 3.12. A CUDA-capable NVIDIA GPU is
+# optional: without one the daemon falls back to CPU automatically
+# (see README.md, "GPU, VRAM and CPU fallback").
+
+# HTTP client: phone-server auth flows and the cloud LLM backends
+# (daemon.py, llm_provider.py)
+requests>=2.31
+
+# Speech-to-text. faster-whisper pulls in tokenizers/huggingface-hub/av;
+# ctranslate2 and numpy are imported directly by daemon.py (GPU detection,
+# VAD post-processing), so they are listed explicitly rather than relied on
+# transitively.
+faster-whisper>=1.0
+ctranslate2>=4.0
+numpy>=1.26
+
+# MCP server (mcp_server.py): dashboard and settings management over stdio.
+# Only needed if you register the MCP server with an MCP client.
+mcp>=1.2
+
+# Optional: Anthropic cloud LLM backend (llm_provider.py). Imported lazily,
+# only when that backend is selected in setup_llm.py — every other backend
+# (LM Studio, Ollama, OpenAI, Claude Code CLI) works without it.
+anthropic>=0.40
+
+# Development only: test suite (tests/), pure-logic pytest with fake
+# audio/GPU/network backends.
+pytest>=8.0

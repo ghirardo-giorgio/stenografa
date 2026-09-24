@@ -20,18 +20,23 @@ partono senza attesa. Dopo MODEL_IDLE_TIMEOUT secondi di inattivita' viene
 scaricato per liberare la VRAM. Il caricamento parte insieme alla
 registrazione, quindi avviene mentre l'utente sta ancora parlando.
 """
+import array
 import base64
 import gc
 import json
+import math
 import os
 import queue
 import secrets
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import signal
+import unicodedata
+import wave
 from pathlib import Path
 
 import requests
@@ -282,6 +287,11 @@ CONFIG_CMDS = {
         "enabled",
         "_set_pause_media_while_recording",
     ),
+    "set_notifications": ("level", "_set_notifications"),
+    "set_wake_word_enabled": ("enabled", "_set_wake_word_enabled"),
+    "set_wake_phrase_start": ("phrase", "_set_wake_phrase_start"),
+    "set_wake_phrase_stop": ("phrase", "_set_wake_phrase_stop"),
+    "set_silence_timeout": ("seconds", "_set_silence_timeout"),
 }
 
 
@@ -486,6 +496,31 @@ def _load_pause_media_while_recording():
 
 def _save_pause_media_while_recording(enabled):
     _write_config_key("pause_media_while_recording", enabled)
+
+
+# --- quante notifiche di sistema mandare (vedi Stenografa._notify) ---
+# "all": tutte, com'e' sempre stato; "errors": solo quelle critiche (errori
+# di trascrizione, di rete, di traduzione), che segnalano qualcosa da
+# sistemare; "none": nessuna, per chi trova invadenti anche quelle. Gli
+# avvisi informativi ("Nessun testo rilevato", conferme, comandi eseguiti)
+# arrivano comunque all'app telefono via _broadcast, quindi silenziarli non
+# nasconde nulla che non sia visibile altrove.
+NOTIFICATION_LEVELS = ("all", "errors", "none")
+
+
+def _valid_notifications(level):
+    return isinstance(level, str) and level.strip().lower() in NOTIFICATION_LEVELS
+
+
+def _load_notifications():
+    value = _read_config().get("notifications")
+    if _valid_notifications(value):
+        return value.strip().lower()
+    return "all"
+
+
+def _save_notifications(level):
+    _write_config_key("notifications", level)
 
 
 # --- vocabolario di dettatura: elenco di termini (nomi propri, gergo
@@ -698,6 +733,19 @@ SUPPORTED_LANGUAGES = {
 MODEL_NAME = "medium"
 MODEL_DEVICE = "cuda"
 MODEL_COMPUTE_TYPE = "int8_float16"
+# Ripiego quando la GPU non e' utilizzabile: scheda assente, driver mancanti,
+# oppure — il caso piu' comune — VRAM gia' occupata da altro (un gioco, un
+# altro modello). Senza, la dettatura fallisce e basta.
+#
+# Stesso modello, cosi' la qualita' non cambia e non c'e' niente da scaricare:
+# si paga in velocita'. Misure su questa macchina, con 4,5 secondi di audio:
+# medium in int8 su CPU impiega circa 4,5 secondi (in pratica il tempo reale),
+# small 1,8 e base 0,7 ma con errori evidenti gia' su una frase semplice. Per
+# una rete di sicurezza conviene la fedelta': chi preferisse la velocita' puo'
+# mettere "small" qui sotto, tenendo presente che va scaricato al primo uso.
+MODEL_FALLBACK_NAME = MODEL_NAME
+MODEL_FALLBACK_DEVICE = "cpu"
+MODEL_FALLBACK_COMPUTE_TYPE = "int8"
 MODEL_LANGUAGE = "it"  # default se non presente in config.json
 # secondi di inattivita' dopo i quali il modello viene tolto dalla VRAM
 MODEL_IDLE_TIMEOUT = 300
@@ -719,6 +767,323 @@ STATE_THINKING = "thinking"  # in attesa di LM Studio: ai_command o traduzione
 # pulsante — vedi _start_recording/_handle_button_press.
 RECORDING_MAX_DURATION_SECONDS = 180
 
+# --- chiusura automatica sul silenzio ---------------------------------------
+# Dopo questi secondi senza sentire parlare, la dettatura si chiude da sola e
+# il testo raccolto fin li' viene trascritto e incollato. Serve soprattutto
+# all'attivazione vocale, dove capita di dimenticarsi la frase di stop, ma vale
+# per qualunque dettatura a interruttore.
+#
+# Non si applica al "tieni premuto per parlare": li' e' il rilascio del dito a
+# chiudere, e una pausa mentre si pensa non deve interrompere niente.
+SILENCE_TIMEOUT_DEFAULT = 10
+# ogni quanto si controlla la coda della registrazione
+SILENCE_CHECK_INTERVAL = 1.0
+# quanta voce deve esserci nella finestra perche' la dettatura resti aperta.
+# Si misura col rilevatore di voce di faster-whisper (Silero), non contando
+# l'energia del segnale: distinguere una voce dal rumore guardando solo quanto
+# e' forte non funziona in una stanza qualsiasi. Sulla macchina di sviluppo il
+# rumore di fondo — ventole — arriva a picchi sette volte il suo stesso livello
+# medio, e col criterio a energia veniva scambiato per parlato: la dettatura si
+# chiudeva dopo una ventina di secondi invece di dieci, quando capitava una
+# finestra piu' quieta. Col rilevatore di voce lo stesso rumore da zero.
+SILENCE_MIN_SPEECH_SECONDS = 0.4
+# tratti di voce piu' brevi di cosi' non contano: sono i clic e i colpi secchi
+# che il rilevatore, da solo, prende ogni tanto per voce
+SILENCE_VAD_MIN_SPEECH_MS = 250
+# quanti tratti sopra il fondo indicano parlato, quando il rilevatore di voce
+# non e' disponibile e si ripiega sull'energia (vedi _speech_seconds)
+SILENCE_MIN_VOICED_BLOCKS = 3
+# quanto puo' valere l'impostazione: sotto i 3 secondi una pausa per
+# riprendere fiato basterebbe a chiudere la dettatura
+SILENCE_TIMEOUT_MIN = 3
+SILENCE_TIMEOUT_MAX = 120
+
+# --- attivazione vocale ("wake word") ---------------------------------------
+# L'utente puo' avviare e fermare la dettatura pronunciando due frasi scelte
+# da lui (es. "Jarvis" / "Jarvis stop") invece di toccare il pulsante.
+#
+# Perche' non una libreria wake word dedicata (Porcupine, openWakeWord): quelle
+# usano modelli addestrati su UNA parola fissa, mentre qui la frase deve poter
+# essere cambiata dall'utente in qualsiasi momento. Si usa quindi un secondo
+# whisper generico, piccolo, e un confronto testuale tollerante.
+#
+# Il modello dell'ascolto e' volutamente diverso da quello della dettatura:
+# "tiny" su CPU in int8 non tocca la VRAM (quindi non interferisce con lo
+# scarico automatico del "medium", vedi MODEL_IDLE_TIMEOUT) e trascrive la
+# finestra di ascolto in una frazione di secondo.
+WAKE_MODEL_NAME = "tiny"
+WAKE_MODEL_DEVICE = "cpu"
+WAKE_MODEL_COMPUTE_TYPE = "int8"
+# quanti secondi di audio guardare a ogni giro e ogni quanto rifarlo: la
+# finestra e' piu' lunga dell'intervallo cosi' una frase a cavallo di due
+# cicli viene comunque vista intera almeno una volta
+WAKE_WINDOW_SECONDS = 3.0
+WAKE_POLL_INTERVAL = 1.0
+# dopo un riconoscimento si ignora l'audio per un po': la stessa frase resta
+# dentro la finestra per qualche secondo e verrebbe riconosciuta piu' volte
+WAKE_COOLDOWN_SECONDS = 2.5
+# Quando una finestra vale la pena di essere trascritta (vedi _is_silence).
+#
+# Non si usa una soglia fissa sul livello: quanto "forte" arrivi una voce
+# dipende dal guadagno del microfono e da quanto si e' lontani, e varia di
+# ordini di grandezza da un PC all'altro. Su questa macchina il fondo sta
+# intorno a 75 e un suono riprodotto dagli altoparlanti arriva a 116: una
+# soglia fissa tarata piu' in alto scarterebbe sistematicamente il parlato,
+# una tarata piu' in basso farebbe girare il modello di continuo su un
+# microfono piu' sensibile.
+#
+# Si guarda invece di quanto il tratto piu' sonoro supera il piu' silenzioso
+# della stessa finestra: e' il salto fra silenzio e voce, e non dipende dal
+# guadagno.
+WAKE_SILENCE_RATIO = 2.5
+# livello sotto il quale non si considera parlato in nessun caso: evita che in
+# una stanza silenziosissima un fruscio qualsiasi, essendo comunque molte
+# volte il fondo, faccia partire il modello a ogni giro
+WAKE_SILENCE_FLOOR = 60
+# livello oltre il quale la finestra si trascrive comunque, senza guardare il
+# rapporto: se si parla senza pause per tutti e tre i secondi, il tratto piu'
+# silenzioso e' forte quanto il piu' sonoro e il confronto direbbe "silenzio"
+WAKE_SILENCE_LOUD = 800
+# su che durata si misura il livello. Deve stare sotto la durata di una parola
+# pronunciata, altrimenti si torna a mediare voce e silenzio.
+WAKE_SILENCE_BLOCK_SECONDS = 0.2
+# ogni quanto ricominciare da capo il file di ascolto: senza rotazione
+# crescerebbe indefinitamente (~2 MB/minuto)
+WAKE_ROTATE_SECONDS = 60
+# quanto restare fermi dopo una rotazione: solo il tempo che il file nuovo
+# abbia qualche campione dentro
+WAKE_ROTATE_MUTE_SECONDS = 0.5
+# Quanto puo' discostarsi la trascrizione dalla frase attesa, in frazione dei
+# suoi caratteri: si contano le lettere da correggere (distanza di edit), non
+# una percentuale di somiglianza.
+#
+# Il criterio precedente (rapporto di somiglianza) si e' rivelato inadatto:
+# su parole corte una sola lettera in piu' fa crollare il rapporto — "jarvis"
+# contro "giarvis" vale 0.77 — quindi per tollerare gli errori veri bisognava
+# tenere la soglia cosi' bassa da far passare anche parole diverse. Contare le
+# modifiche separa meglio i due casi: "giarvis" dista 2, "arrivi" dista 4.
+WAKE_MATCH_EDIT_FRACTION = 0.25
+# frasi piu' corte di cosi' (dopo la normalizzazione) verrebbero riconosciute
+# ovunque, dentro parole comuni: si rifiutano in fase di configurazione
+WAKE_PHRASE_MIN_CHARS = 3
+# la frase puo' contenere piu' varianti separate da virgola (vedi
+# _phrase_variants), quindi il limite e' sulla riga intera
+WAKE_PHRASE_MAX_CHARS = 160
+WAKE_PHRASE_START_DEFAULT = "jarvis"
+WAKE_PHRASE_STOP_DEFAULT = "jarvis stop"
+
+
+def _load_wake_word_enabled():
+    value = _read_config().get("wake_word_enabled")
+    # spento di default: tenere il microfono sempre aperto e' una scelta che
+    # deve essere esplicita, non un comportamento che compare da solo
+    return bool(value) if isinstance(value, bool) else False
+
+
+def _save_wake_word_enabled(enabled):
+    _write_config_key("wake_word_enabled", enabled)
+
+
+def _load_wake_phrase_start():
+    value = _read_config().get("wake_phrase_start")
+    return value if isinstance(value, str) and value.strip() else (
+        WAKE_PHRASE_START_DEFAULT
+    )
+
+
+def _save_wake_phrase_start(phrase):
+    _write_config_key("wake_phrase_start", phrase)
+
+
+def _load_wake_phrase_stop():
+    value = _read_config().get("wake_phrase_stop")
+    return value if isinstance(value, str) and value.strip() else (
+        WAKE_PHRASE_STOP_DEFAULT
+    )
+
+
+def _save_wake_phrase_stop(phrase):
+    _write_config_key("wake_phrase_stop", phrase)
+
+
+def _load_silence_timeout():
+    value = _read_config().get("silence_timeout")
+    if not isinstance(value, int) or isinstance(value, bool):
+        return SILENCE_TIMEOUT_DEFAULT
+    # 0 = spento; fuori intervallo si torna al default invece di rifiutare,
+    # cosi' un config.json modificato a mano non blocca la dettatura
+    if value == 0:
+        return 0
+    if SILENCE_TIMEOUT_MIN <= value <= SILENCE_TIMEOUT_MAX:
+        return value
+    return SILENCE_TIMEOUT_DEFAULT
+
+
+def _save_silence_timeout(seconds):
+    _write_config_key("silence_timeout", seconds)
+
+
+def _normalize_phrase(text):
+    """Riduce il testo alla forma usata per il confronto: minuscole, senza
+    accenti ne' punteggiatura, spazi singoli. Serve a far combaciare quello
+    che l'utente ha scritto nelle impostazioni con quello che whisper
+    trascrive, che differisce quasi sempre per maiuscole e virgole."""
+    if not isinstance(text, str):
+        return ""
+    decomposed = unicodedata.normalize("NFD", text.lower())
+    stripped = "".join(
+        ch for ch in decomposed if not unicodedata.combining(ch)
+    )
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in stripped)
+    return " ".join(cleaned.split())
+
+
+def _phrase_variants(phrase):
+    """Le forme accettate per una frase di attivazione, separate da virgola.
+
+    Serve perche' i riconoscitori vocali scrivono quello che sentono nella
+    lingua di dettatura: "Jarvis" detto in italiano diventa "già visto",
+    "ciarvis", "Charles". Sul PC si puo' correggere il tiro con
+    l'initial_prompt (vedi _wake_prompt), ma il riconoscitore del telefono non
+    accetta suggerimenti: li' l'unico rimedio e' che l'utente aggiunga come
+    suona davvero la sua frase.
+
+    La prima variante e' quella "ufficiale": e' la grafia che si vuole
+    ottenere, e l'unica che finisce nel suggerimento al modello."""
+    if not isinstance(phrase, str):
+        return []
+    variants = []
+    for piece in phrase.split(","):
+        normalized = _normalize_phrase(piece)
+        if normalized and normalized not in variants:
+            variants.append(normalized)
+    return variants
+
+
+def _edit_distance(a, b):
+    """Quante lettere bisogna cambiare, togliere o aggiungere per passare da
+    `a` a `b`."""
+    if a == b:
+        return 0
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, 1):
+        current = [i]
+        for j, char_b in enumerate(b, 1):
+            current.append(
+                min(
+                    previous[j] + 1,  # cancellazione
+                    current[j - 1] + 1,  # inserimento
+                    previous[j - 1] + (char_a != char_b),  # sostituzione
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def _max_edits(target):
+    """Quanti errori si accettano su una frase lunga `len(target)`. Almeno uno,
+    altrimenti le frasi corte non tollererebbero nulla."""
+    return max(1, round(len(target) * WAKE_MATCH_EDIT_FRACTION))
+
+
+def _phrase_in_text(phrase, text, only_tail=False):
+    """True se `phrase` (o una delle sue varianti) compare in `text`,
+    tollerando gli errori di trascrizione. Confronta la frase con ogni
+    sequenza di parole di `text` lunga quanto la frase (piu' una parola in
+    meno e una in piu', perche' il modello a volte fonde o spezza le parole).
+
+    `only_tail` limita la ricerca alle ultime parole: serve quando si cerca la
+    frase di stop dentro una dettatura in corso, dove trovarla in mezzo
+    significherebbe interrompere l'utente a meta' di una frase."""
+    haystack = _normalize_phrase(text)
+    if not haystack:
+        return False
+    all_words = haystack.split()
+    for target in _phrase_variants(phrase):
+        span = len(target.split())
+        if only_tail and len(all_words) > span + 2:
+            words = all_words[-(span + 2) :]
+        else:
+            words = all_words
+        if target in " ".join(words):
+            return True
+        allowed = _max_edits(target)
+        for size in {max(1, span - 1), span, span + 1}:
+            for start in range(0, max(0, len(words) - size) + 1):
+                window = " ".join(words[start : start + size])
+                # una finestra molto piu' lunga o corta non puo' rientrare nel
+                # margine: si evita di calcolare la distanza per niente
+                if abs(len(window) - len(target)) > allowed:
+                    continue
+                if _edit_distance(target, window) <= allowed:
+                    return True
+    return False
+
+
+def _wake_prompt(start_phrase, stop_phrase):
+    """Contesto da dare al modello dell'ascolto perche' scriva le frasi con la
+    grafia scelta dall'utente invece di renderle in italiano. Solo la prima
+    variante di ciascuna: le altre esistono proprio perche' sono le rese
+    sbagliate, non vanno suggerite al modello."""
+    parts = []
+    for phrase in (start_phrase, stop_phrase):
+        variants = _phrase_variants(phrase)
+        if variants:
+            # si riprende il testo originale della prima variante, non quello
+            # normalizzato, cosi' il suggerimento resta scritto come l'utente
+            # lo ha inserito
+            first = phrase.split(",")[0].strip()
+            parts.append(first if first else variants[0])
+    return ". ".join(parts) + "." if parts else None
+
+
+def _valid_wake_phrase(phrase):
+    if not isinstance(phrase, str):
+        return False
+    if len(phrase.strip()) > WAKE_PHRASE_MAX_CHARS:
+        return False
+    variants = _phrase_variants(phrase)
+    if not variants:
+        return False
+    # ogni variante deve reggersi da sola: una troppo corta farebbe scattare
+    # l'attivazione dentro le parole di una conversazione normale
+    return all(len(v) >= WAKE_PHRASE_MIN_CHARS for v in variants)
+
+
+def _strip_wake_phrases(text, start_phrase, stop_phrase):
+    """Toglie dal testo dettato le frasi di attivazione, che il modello della
+    dettatura trascrive come tutto il resto: la frase di avvio finisce in testa
+    (l'inizio della registrazione la cattura ancora), quella di stop in coda.
+    Rimuove solo le occorrenze ai bordi: in mezzo al testo sono parole che
+    l'utente ha dettato davvero.
+
+    La frase di stop va tolta per prima: contenendo di solito quella di avvio
+    ("jarvis" / "jarvis stop"), togliere prima l'avvio la spezzerebbe a meta'
+    lasciando un pezzo nel testo."""
+    words = text.split()
+    for phrase, from_start in ((stop_phrase, False), (start_phrase, True)):
+        # ogni variante ha una lunghezza sua: si provano tutte, dalla piu'
+        # lunga, cosi' "gia visto" viene tolto per intero e non a meta'
+        spans = sorted(
+            {len(v.split()) for v in _phrase_variants(phrase)}, reverse=True
+        )
+        sizes = []
+        for span in spans:
+            # per ciascuna: la lunghezza esatta, una parola in piu', una in
+            # meno — stesso motivo di _phrase_in_text
+            for size in (span, span + 1, max(1, span - 1)):
+                if size not in sizes:
+                    sizes.append(size)
+        for size in sizes:
+            if size > len(words):
+                continue
+            edge = words[:size] if from_start else words[len(words) - size :]
+            if _phrase_in_text(phrase, " ".join(edge)):
+                words = words[size:] if from_start else words[: len(words) - size]
+                break
+    return " ".join(words).strip(" ,.;:-").strip()
+
+
 # --- pulsante "comando vocale IA" (kind="ai_command"): in alternativa a
 # dettare e incollare testo, invia la frase trascritta a un modello
 # linguistico che la traduce in una combinazione di tasti da eseguire (es.
@@ -736,6 +1101,11 @@ AI_COMMAND_MAX_OPTIONS = 6
 # benissimo non rispondere mai (posa il telefono, cambia idea): scaduta,
 # la richiesta si chiude da sola e non esegue nulla.
 AI_COMMAND_CHOICE_TIMEOUT = 90
+# lunghezza massima di un comando IA scritto arrivato dal socket di
+# controllo (vedi _handle_control_ai_command): non e' una frase dettata ma
+# testo digitato, quindi conviene un tetto esplicito prima di spedirlo
+# all'LLM
+CONTROL_AI_MAX_TEXT = 500
 AI_COMMAND_SYSTEM_PROMPT = (
     "Interpreti un comando vocale dettato da un utente e lo traduci nelle "
     "combinazioni di tasti da premere su un PC per eseguirlo. Rispondi SOLO "
@@ -777,6 +1147,42 @@ AI_COMMAND_MACRO_PROMPT_TEMPLATE = (
     "per nessun'altra: se il task descritto non ha senso per questa "
     "applicazione, rispondi con un array vuoto []."
 )
+
+# --- comandi da terminale (solo per i comandi IA arrivati dal socket di
+# controllo, cioe' da una dashboard sullo stesso PC: vedi
+# _handle_control_ai_command). Non sono mai offerti al telefono, per due
+# motivi: il pannello di scelta dell'app sa gestire solo scorciatoie e
+# avvii di applicazioni, e soprattutto un comando shell va confermato
+# leggendolo, cosa che ha senso su uno schermo davanti a chi lo esegue.
+# Nessuna esecuzione avviene senza una conferma esplicita (vedi
+# _handle_control_ai_choose): l'unica difesa che regge davvero contro un
+# comando sbagliato o male interpretato e' che l'utente lo veda in chiaro
+# prima, non una lista di comandi vietati che si aggira in dieci modi.
+AI_COMMAND_SHELL_PROMPT = (
+    "\n\nSe invece il comando descrive un'operazione da TERMINALE (compilare, "
+    "avviare uno script, gestire file, git, pacchetti), l'elemento deve avere "
+    "i campi \"label\" e \"shell\" (array di comandi bash da eseguire in "
+    "sequenza nella stessa shell, es. [\"cd ~/progetto\", \"npm run build\"]) "
+    "al posto di \"combo\". La shell parte dalla home dell'utente e ricorda "
+    "le directory: un \"cd\" vale anche per i comandi successivi. Usa "
+    "\"shell\" solo quando l'operazione richiesta e' davvero da riga di "
+    "comando; se la stessa cosa si fa con una scorciatoia dell'applicazione "
+    "in primo piano, preferisci \"combo\". Non proporre comandi distruttivi "
+    "(cancellazioni ricorsive, formattazioni, modifiche a file di sistema) a "
+    "meno che l'utente non li abbia chiesti esplicitamente e senza ambiguita'."
+)
+# quanti comandi al massimo puo' contenere un candidato shell, e quanto puo'
+# essere lungo ognuno: tetti stretti perche' tutto deve restare leggibile in
+# un pannello di conferma, non perche' proteggano da qualcosa
+CONTROL_SHELL_MAX_COMMANDS = 8
+CONTROL_SHELL_MAX_LENGTH = 500
+# oltre questo tempo il comando viene interrotto: il pannello che ha chiesto
+# l'esecuzione sta aspettando la risposta, non puo' restare appeso a una
+# compilazione infinita
+CONTROL_SHELL_TIMEOUT = 120
+# quanto output riportare al pannello (il resto e' troncato): serve a capire
+# se e' andata bene, non a leggere un log intero
+CONTROL_SHELL_OUTPUT_CHARS = 2000
 
 # --- storico delle ultime dettature: tenuto solo in memoria (non finisce
 # mai su disco: e' testo dettato dall'utente, spesso privato) e visibile
@@ -862,6 +1268,18 @@ TERMINAL_WM_CLASS_KEYWORDS = (
 )
 
 
+def _cuda_available():
+    """Se c'e' almeno una GPU CUDA utilizzabile. Costa una manciata di
+    millisecondi e non carica niente in VRAM: dice pero' solo che la scheda
+    c'e', non che ci sia posto — la VRAM occupata si scopre solo caricando."""
+    try:
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
 class ModelManager:
     """Tiene il modello faster-whisper in VRAM, con scarico automatico.
 
@@ -869,7 +1287,7 @@ class ModelManager:
     perche' transcribe() richiama il caricamento tenendo gia' il lock.
     """
 
-    def __init__(self, language=MODEL_LANGUAGE):
+    def __init__(self, language=MODEL_LANGUAGE, on_fallback=None):
         self._lock = threading.RLock()
         self._model = None
         self._last_used = 0.0
@@ -877,18 +1295,47 @@ class ModelManager:
         # richiede di ricaricare il modello, e' solo un parametro passato a
         # transcribe(). "auto" = rilevamento automatico della lingua.
         self.language = language
+        # su cosa sta girando davvero il modello: resta MODEL_DEVICE finche'
+        # la GPU regge, diventa MODEL_FALLBACK_DEVICE quando si ripiega.
+        # Se di schede non ce n'e' nessuna lo si sa subito, senza aspettare il
+        # primo caricamento fallito: serve a chi detta dal telefono per sapere
+        # in anticipo che il PC e' in difficolta' (vedi _transcribe_on_phone).
+        self.device = (
+            MODEL_DEVICE if _cuda_available() else MODEL_FALLBACK_DEVICE
+        )
+        # avvisa che si sta andando a CPU: la dettatura funziona ma diventa
+        # molto piu' lenta, ed e' bene che l'utente sappia perche'
+        self._on_fallback = on_fallback
 
     def _load_locked(self):
-        if self._model is None:
-            # import ritardato: importare faster_whisper costa ~1s e non
-            # serve finche' non si detta davvero
-            from faster_whisper import WhisperModel
+        if self._model is not None:
+            self._last_used = time.monotonic()
+            return self._model
 
+        # import ritardato: importare faster_whisper costa ~1s e non
+        # serve finche' non si detta davvero
+        from faster_whisper import WhisperModel
+
+        try:
             self._model = WhisperModel(
                 MODEL_NAME,
                 device=MODEL_DEVICE,
                 compute_type=MODEL_COMPUTE_TYPE,
             )
+            self.device = MODEL_DEVICE
+        except Exception as exc:
+            # non si distingue fra i motivi (scheda assente, driver, VRAM
+            # occupata): l'unica cosa che conta e' che su GPU non si puo'
+            # caricare, e che senza ripiego la dettatura fallirebbe
+            self._model = WhisperModel(
+                MODEL_FALLBACK_NAME,
+                device=MODEL_FALLBACK_DEVICE,
+                compute_type=MODEL_FALLBACK_COMPUTE_TYPE,
+            )
+            self.device = MODEL_FALLBACK_DEVICE
+            if self._on_fallback is not None:
+                self._on_fallback(f"{type(exc).__name__}: {exc}")
+
         self._last_used = time.monotonic()
         return self._model
 
@@ -950,11 +1397,475 @@ class ModelManager:
                 and time.monotonic() - self._last_used > MODEL_IDLE_TIMEOUT
             ):
                 self._model = None
+                # al prossimo caricamento si riprova dalla GPU: se si era
+                # ripiegato perche' la VRAM era occupata, nel frattempo puo'
+                # essersi liberata
+                self.device = MODEL_DEVICE
                 gc.collect()
                 return True
             return False
         finally:
             self._lock.release()
+
+
+def _wav_data_offset(fh):
+    """Offset del primo byte di audio in un file WAV, scorrendo i chunk RIFF.
+
+    Non si puo' assumere l'header canonico da 44 byte: pw-record e soundfile
+    possono inserire chunk (LIST, fact) prima di "data"."""
+    fh.seek(0)
+    if fh.read(4) != b"RIFF":
+        return None
+    fh.seek(12)  # salta la dimensione RIFF e il tag "WAVE"
+    while True:
+        header = fh.read(8)
+        if len(header) < 8:
+            return None
+        chunk_id = header[0:4]
+        size = int.from_bytes(header[4:8], "little")
+        if chunk_id == b"data":
+            return fh.tell()
+        # i chunk hanno padding a byte pari
+        fh.seek(size + (size % 2), 1)
+
+
+def _read_wav_tail(path, seconds, sample_rate=16000, sample_width=2):
+    """Ritorna gli ultimi `seconds` di audio grezzo (PCM) da un WAV **ancora in
+    scrittura**.
+
+    Il modulo `wave` non serve in lettura: finche' il file e' aperto da chi
+    registra, l'header dichiara una lunghezza sbagliata (spesso zero). Qui si
+    ignora quel campo e si legge la coda reale del file."""
+    with open(path, "rb") as fh:
+        start = _wav_data_offset(fh)
+        if start is None:
+            return b""
+        fh.seek(0, 2)
+        end = fh.tell()
+        wanted = int(seconds * sample_rate) * sample_width
+        begin = max(start, end - wanted)
+        # allinea al campione: partire a meta' campione sfaserebbe l'audio
+        begin -= (begin - start) % sample_width
+        fh.seek(begin)
+        return fh.read(end - begin)
+
+
+def _write_wav(path, pcm, sample_rate=16000, sample_width=2):
+    with wave.open(path, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(sample_width)
+        out.setframerate(sample_rate)
+        out.writeframes(pcm)
+
+
+def _wav_header(sample_rate=16000, sample_width=2, channels=1):
+    """Header WAV canonico da 44 byte con le lunghezze ancora a zero.
+
+    E' lo stato in cui pw-record lascia il file mentre registra, e quello che
+    _read_wav_tail sa gia' leggere; le lunghezze vere si scrivono alla
+    chiusura (vedi PhoneAudioSink)."""
+    byte_rate = sample_rate * channels * sample_width
+    return b"".join(
+        [
+            b"RIFF",
+            (0).to_bytes(4, "little"),
+            b"WAVE",
+            b"fmt ",
+            (16).to_bytes(4, "little"),
+            (1).to_bytes(2, "little"),  # formato PCM
+            channels.to_bytes(2, "little"),
+            sample_rate.to_bytes(4, "little"),
+            byte_rate.to_bytes(4, "little"),
+            (channels * sample_width).to_bytes(2, "little"),
+            (sample_width * 8).to_bytes(2, "little"),
+            b"data",
+            (0).to_bytes(4, "little"),
+        ]
+    )
+
+
+class PhoneAudioSink:
+    """Scrive in un WAV l'audio che arriva dal telefono, un blocco alla volta.
+
+    Prende il posto di pw-record quando a registrare e' il microfono del
+    telefono e a trascrivere resta il PC (vedi _start_recording): il file che
+    ne esce e' indistinguibile da quello registrato in locale, cosi' tutto
+    quello che viene dopo — controllo del silenzio, trascrizione, vocabolario
+    — non ha bisogno di sapere chi l'ha riempito.
+
+    append() gira nel thread del socket, close() nel thread principale."""
+
+    # posizione dei due campi di lunghezza dentro l'header da 44 byte
+    _RIFF_SIZE_OFFSET = 4
+    _DATA_SIZE_OFFSET = 40
+
+    def __init__(self, path, sample_rate=16000, sample_width=2):
+        self._lock = threading.Lock()
+        self._written = 0
+        self._fh = open(path, "wb")
+        self._fh.write(_wav_header(sample_rate, sample_width))
+        self._fh.flush()
+
+    def append(self, pcm):
+        with self._lock:
+            if self._fh is None:
+                return
+            self._fh.write(pcm)
+            # senza flush il controllo del silenzio leggerebbe un file fermo
+            # e chiuderebbe la dettatura mentre l'utente sta ancora parlando
+            self._fh.flush()
+            self._written += len(pcm)
+
+    def close(self):
+        """Corregge le lunghezze dichiarate nell'header e chiude. Va fatto
+        prima di trascrivere: faster-whisper decodifica il file con ffmpeg,
+        che su un header a zero non troverebbe nessun audio."""
+        with self._lock:
+            if self._fh is None:
+                return
+            self._fh.seek(self._RIFF_SIZE_OFFSET)
+            self._fh.write((36 + self._written).to_bytes(4, "little"))
+            self._fh.seek(self._DATA_SIZE_OFFSET)
+            self._fh.write(self._written.to_bytes(4, "little"))
+            self._fh.close()
+            self._fh = None
+
+
+def _block_levels(pcm):
+    """Livello (RMS) di ogni tratto da WAKE_SILENCE_BLOCK_SECONDS."""
+    samples = array.array("h")
+    # tronca a un numero intero di campioni
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % samples.itemsize)])
+    block = int(16000 * WAKE_SILENCE_BLOCK_SECONDS)
+    levels = []
+    for start in range(0, len(samples), block):
+        # si guarda un campione ogni 4: basta per distinguere voce da silenzio
+        # e costa un quarto del tempo
+        chunk = samples[start : start + block : 4]
+        if chunk:
+            levels.append(math.sqrt(sum(s * s for s in chunk) / len(chunk)))
+    return levels
+
+
+def _is_silence(pcm):
+    """True se in tutta la finestra non c'e' niente che somigli a una voce.
+    Evita di far girare whisper sul silenzio, che e' il caso normale mentre si
+    aspetta la frase.
+
+    Si confronta il tratto piu' sonoro col piu' silenzioso della stessa
+    finestra, invece di misurare il livello assoluto: vedi WAKE_SILENCE_RATIO
+    per il perche'. E si guarda per tratti brevi, non sull'intera finestra:
+    "Jarvis" dura mezzo secondo dentro una finestra di tre, e mediando,
+    l'energia della parola si annacqua nel silenzio che la circonda."""
+    levels = _block_levels(pcm)
+    if not levels:
+        return True
+    peak = max(levels)
+    if peak < WAKE_SILENCE_FLOOR:
+        return True
+    if peak >= WAKE_SILENCE_LOUD:
+        return False
+    floor = min(levels)
+    if floor <= 0:
+        return False
+    return peak < floor * WAKE_SILENCE_RATIO
+
+
+def _speech_seconds(pcm):
+    """Quanti secondi di voce ci sono nell'audio, secondo il rilevatore di
+    voce di faster-whisper (Silero). None se non e' disponibile.
+
+    E' lo stesso rilevatore che la trascrizione usa per saltare le pause
+    (`vad_filter`), quindi non aggiunge dipendenze; costa una decina di
+    millisecondi su una finestra di dieci secondi."""
+    try:
+        import numpy as np
+        from faster_whisper.vad import get_speech_timestamps, VadOptions
+    except Exception:
+        return None
+    try:
+        # tronca a un numero intero di campioni: con un byte spaiato
+        # frombuffer solleva, e il rilevatore verrebbe scartato in silenzio
+        # ripiegando sul criterio a energia, molto meno affidabile
+        pcm = pcm[: len(pcm) - (len(pcm) % 2)]
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        segments = get_speech_timestamps(
+            audio,
+            VadOptions(min_speech_duration_ms=SILENCE_VAD_MIN_SPEECH_MS),
+        )
+        return sum(s["end"] - s["start"] for s in segments) / 16000
+    except Exception:
+        return None
+
+
+def _no_voiced_blocks(pcm):
+    """Ripiego a energia, per quando il rilevatore di voce non e' disponibile.
+
+    Meno affidabile in una stanza rumorosa (vedi SILENCE_MIN_SPEECH_SECONDS),
+    ma meglio di lasciare la dettatura aperta per sempre."""
+    levels = _block_levels(pcm)
+    if not levels:
+        return False
+    # il fondo si stima sul quarto piu' silenzioso della finestra, non sul
+    # minimo assoluto: il rumore di una stanza respira, e prendere il singolo
+    # tratto piu' quieto come riferimento fa passare per voce le sue stesse
+    # fluttuazioni
+    background = sorted(levels)[len(levels) // 4]
+    # il tetto serve a chi parla senza pause per tutta la finestra: li' anche
+    # il "fondo" e' parlato, e senza un limite la soglia salirebbe sopra la
+    # voce stessa facendola sembrare silenzio
+    voice_level = min(
+        max(WAKE_SILENCE_FLOOR, background * WAKE_SILENCE_RATIO),
+        WAKE_SILENCE_LOUD,
+    )
+    loud_blocks = sum(1 for level in levels if level >= voice_level)
+    return loud_blocks < SILENCE_MIN_VOICED_BLOCKS
+
+
+def _tail_is_silent(wav_path, seconds):
+    """True se negli ultimi `seconds` della registrazione in corso non si e'
+    parlato.
+
+    Non si riusa _is_silence: quello confronta il tratto piu' sonoro col piu'
+    silenzioso per accorgersi che *c'e'* una voce, e su una finestra lunga di
+    stanza vuota una fluttuazione qualsiasi del rumore basta a superare il
+    rapporto. Nella prova dal vivo la dettatura si chiudeva dopo una ventina di
+    secondi invece di dieci, quando capitava una finestra abbastanza uniforme.
+
+    Qui interessa il contrario — accertarsi che *non* ci sia voce — quindi si
+    conta per quanto tempo il suono sta sopra il fondo di quella stessa
+    finestra. Un colpo isolato (una porta, un tasto) non tiene aperta la
+    dettatura; mezzo secondo di parlato si'.
+
+    Ritorna False finche' l'audio registrato e' piu' corto della finestra
+    richiesta: altrimenti una dettatura appena iniziata verrebbe chiusa subito,
+    avendo "tutto silenzio" semplicemente perche' non c'e' ancora niente. Lo
+    stesso vale se il file non c'e' piu': puo' sparire fra un controllo e
+    l'altro, quando la dettatura finisce e la trascrizione lo consuma."""
+    try:
+        pcm = _read_wav_tail(wav_path, seconds)
+    except OSError:
+        return False
+    if len(pcm) < int(seconds * 16000) * 2:
+        return False
+    speech = _speech_seconds(pcm)
+    if speech is None:
+        return _no_voiced_blocks(pcm)
+    return speech < SILENCE_MIN_SPEECH_SECONDS
+
+
+class WakeWordListener:
+    """Ascolta il microfono e segnala quando sente la frase di attivazione.
+
+    Non tocca mai lo stato del demone: accoda ("wake", "start"|"stop") sulla
+    command_queue, come fa _transcribe_worker con ("done", ...), cosi' le
+    transizioni restano tutte nel thread principale.
+
+    Non apre mai un secondo microfono. Quando non si sta dettando registra per
+    conto proprio su uno slot separato del backend; quando la dettatura e' in
+    corso legge la coda del file che sta gia' scrivendo la dettatura stessa,
+    cercando la frase di stop."""
+
+    def __init__(
+        self,
+        backend,
+        command_queue,
+        phrases_provider,
+        language_provider,
+        on_heard=None,
+    ):
+        self._backend = backend
+        self._queue = command_queue
+        self._phrases = phrases_provider
+        self._language = language_provider
+        # riceve quello che il microfono del PC ha capito, riconosciuto o no:
+        # e' l'unico modo per l'utente di sapere perche' la sua frase non
+        # scatta (il modello puo' averla sentita in tutt'altro modo)
+        self._on_heard = on_heard
+        self._lock = threading.Lock()
+        self._thread = None
+        self._running = False
+        self._model = None
+        # sorgente corrente: ("own", path) mentre si aspetta la frase di
+        # avvio, ("recording", path) mentre si aspetta quella di stop
+        self._source = None
+        self._own_path = None
+        self._own_started_at = 0.0
+        self._muted_until = 0.0
+
+    # --- ciclo di vita ---
+
+    @property
+    def running(self):
+        return self._running
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=WAKE_POLL_INTERVAL + 2)
+        self._stop_own_capture()
+        with self._lock:
+            self._source = None
+        # il modello resta caricato: e' piccolo (~75 MB in RAM) e ricaricarlo
+        # a ogni riaccensione dell'ascolto costerebbe piu' di quanto valga
+
+    # --- sorgente audio ---
+
+    def follow_recording(self, wav_path):
+        """Passa ad ascoltare il file della dettatura in corso (frase di stop)."""
+        if not self._running:
+            return
+        self._stop_own_capture()
+        with self._lock:
+            self._source = ("recording", wav_path)
+            self._muted_until = time.monotonic() + WAKE_COOLDOWN_SECONDS
+
+    def follow_own_capture(self):
+        """Torna ad ascoltare per conto proprio (frase di avvio)."""
+        if not self._running:
+            return
+        with self._lock:
+            self._source = None
+        # l'inizio del file e' quasi sempre la coda della frase di stop appena
+        # pronunciata: senza attesa la dettatura ripartirebbe da sola
+        self._start_own_capture(mute_for=WAKE_COOLDOWN_SECONDS)
+
+    def _start_own_capture(self, mute_for=WAKE_COOLDOWN_SECONDS):
+        try:
+            fd, path = tempfile.mkstemp(prefix="stenografa-wake-", suffix=".wav")
+            os.close(fd)
+            self._backend.start_recording(path, slot="wake")
+        except Exception:
+            return
+        self._own_path = path
+        self._own_started_at = time.monotonic()
+        with self._lock:
+            self._source = ("own", path)
+            self._muted_until = time.monotonic() + mute_for
+
+    def _stop_own_capture(self):
+        path = self._own_path
+        self._own_path = None
+        if path is None:
+            return
+        try:
+            self._backend.stop_recording(slot="wake")
+        except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _rotate_own_capture_if_needed(self):
+        if self._own_path is None:
+            return
+        if time.monotonic() - self._own_started_at < WAKE_ROTATE_SECONDS:
+            return
+        # il file cresce di ~2 MB al minuto: si ricomincia da capo, tanto
+        # interessa solo la coda. Qui non serve la pausa di
+        # WAKE_COOLDOWN_SECONDS (non c'e' nessuna frase appena riconosciuta da
+        # cui difendersi): basta il tempo di avere qualche campione nel file
+        # nuovo, altrimenti l'ascolto resterebbe sordo per qualche secondo ad
+        # ogni rotazione
+        self._stop_own_capture()
+        self._start_own_capture(mute_for=WAKE_ROTATE_MUTE_SECONDS)
+
+    # --- riconoscimento ---
+
+    def _load_model(self):
+        if self._model is None:
+            from faster_whisper import WhisperModel
+
+            self._model = WhisperModel(
+                WAKE_MODEL_NAME,
+                device=WAKE_MODEL_DEVICE,
+                compute_type=WAKE_MODEL_COMPUTE_TYPE,
+            )
+        return self._model
+
+    def _transcribe(self, pcm):
+        model = self._load_model()
+        fd, path = tempfile.mkstemp(prefix="stenografa-wake-win-", suffix=".wav")
+        os.close(fd)
+        try:
+            _write_wav(path, pcm)
+            language = self._language()
+            start_phrase, stop_phrase = self._phrases()
+            segments, _info = model.transcribe(
+                path,
+                language=None if language == "auto" else language,
+                beam_size=1,  # l'ascolto deve essere veloce, non accurato
+                vad_filter=True,
+                condition_on_previous_text=False,
+                # decisivo per le frasi che non appartengono alla lingua di
+                # dettatura: senza, un "Jarvis" detto in italiano viene
+                # trascritto "Ciao, vi!" e non combacia con niente. Dando le
+                # frasi come contesto il modello ne riusa la grafia (stesso
+                # meccanismo del vocabolario di dettatura, vedi
+                # _vocabulary_for_dashboard).
+                initial_prompt=_wake_prompt(start_phrase, stop_phrase),
+            )
+            return " ".join(s.text.strip() for s in segments).strip()
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _loop(self):
+        if self._source is None and self._own_path is None:
+            self._start_own_capture()
+        while self._running:
+            time.sleep(WAKE_POLL_INTERVAL)
+            if not self._running:
+                return
+            try:
+                self._tick()
+            except Exception:
+                # un errore di lettura o di modello non deve spegnere
+                # l'ascolto ne' il demone: si riprova al giro dopo
+                time.sleep(WAKE_POLL_INTERVAL)
+
+    def _tick(self):
+        with self._lock:
+            source = self._source
+            muted = time.monotonic() < self._muted_until
+        if source is None or muted:
+            return
+        mode, path = source
+        if mode == "own":
+            self._rotate_own_capture_if_needed()
+        if not os.path.exists(path):
+            return
+        pcm = _read_wav_tail(path, WAKE_WINDOW_SECONDS)
+        if len(pcm) < 16000 or _is_silence(pcm):
+            return
+        text = self._transcribe(pcm)
+        if not text:
+            return
+        if self._on_heard is not None:
+            self._on_heard(text)
+        start_phrase, stop_phrase = self._phrases()
+        phrase = stop_phrase if mode == "recording" else start_phrase
+        if not _phrase_in_text(phrase, text):
+            return
+        with self._lock:
+            # se nel frattempo la sorgente e' cambiata (la dettatura e'
+            # partita o finita per altra via) il riconoscimento e' vecchio
+            if self._source != source:
+                return
+            self._muted_until = time.monotonic() + WAKE_COOLDOWN_SECONDS
+        self._queue.put(("wake", "stop" if mode == "recording" else "start"))
 
 
 class Stenografa:
@@ -967,9 +1878,52 @@ class Stenografa:
         # premuto per parlare"
         self._recording_watchdog_timer = None
         self.command_queue = queue.Queue()
-        self.model = ModelManager(language=_load_language())
+        self.model = ModelManager(
+            language=_load_language(), on_fallback=self._on_model_fallback
+        )
         self.backend = platform_backend.get_backend(RUNTIME_DIR)
         self.restore_clipboard = _load_restore_clipboard()
+        # attivazione vocale: le frasi sono lette a ogni giro dal listener,
+        # cosi' cambiarle dalle impostazioni ha effetto subito senza riavviare
+        # l'ascolto (vedi WakeWordListener)
+        self.wake_word_enabled = _load_wake_word_enabled()
+        self.wake_phrase_start = _load_wake_phrase_start()
+        self.wake_phrase_stop = _load_wake_phrase_stop()
+        # true quando la dettatura in corso e' stata avviata a voce dal
+        # telefono: l'ascolto e' sul telefono ma le frasi finiscono comunque
+        # nell'audio registrato dal PC (vedi _handle_button_press)
+        self._recording_from_wake = False
+        # true quando a trascrivere e' il telefono invece del PC: succede
+        # quando la GPU non e' utilizzabile e la CPU sarebbe troppo lenta
+        # (vedi _handle_button_press e _on_dictated_text)
+        self._recording_by_phone = False
+        # true quando a registrare e' il microfono del telefono ma a
+        # trascrivere resta il PC: serve quando il microfono del PC non e'
+        # utilizzabile (occupato da un'altra applicazione). E' l'opposto di
+        # _recording_by_phone e i due non valgono mai insieme: li' il telefono
+        # consegna il testo, qui l'audio (vedi _append_phone_audio).
+        self._recording_mic_from_phone = False
+        # file aperto in scrittura mentre i blocchi audio arrivano dal
+        # telefono, e connessione che li sta mandando: se quella cade a meta'
+        # dettatura non arrivera' piu' niente da nessuno
+        self._phone_audio = None
+        self._phone_audio_conn = None
+        # chiusura automatica dopo un silenzio prolungato (0 = spenta)
+        self.silence_timeout = _load_silence_timeout()
+        self._silence_stop = None
+        self._silence_thread = None
+        # ultima frase capita dal microfono del PC, riconosciuta o no: l'app
+        # la mostra nelle impostazioni accanto a quella del telefono
+        self.wake_heard = ""
+        self.wake_listener = WakeWordListener(
+            self.backend,
+            self.command_queue,
+            lambda: (self.wake_phrase_start, self.wake_phrase_stop),
+            lambda: self.model.language,
+            on_heard=lambda text: self.command_queue.put(("wake_heard", text)),
+        )
+        # quante notifiche di sistema mandare (vedi NOTIFICATION_LEVELS)
+        self.notifications = _load_notifications()
         # contenuto degli appunti catturato all'avvio della registrazione
         # (solo se restore_clipboard e' attivo), da ripristinare dopo
         # l'incolla automatico del testo dettato
@@ -1039,6 +1993,30 @@ class Stenografa:
         # "expires_at"}. Finche' e' valorizzata il telefono sta mostrando il
         # pannello di scelta e nessuna combinazione e' stata eseguita.
         self._pending_choice = None
+        # come sopra, ma per i comandi IA scritti arrivati dal socket di
+        # controllo (dashboard sul PC): tenuta separata da _pending_choice
+        # perche' i due pannelli vivono su schermi diversi e una scelta in
+        # sospeso sul telefono non deve annullare quella sul PC. Il socket
+        # di controllo risponde da thread separati, quindi serve un lock.
+        self._control_choice = None
+        self._control_choice_lock = threading.Lock()
+        # cosa sta facendo il comando IA chiesto dal PC, per il pannello che
+        # lo segue interrogando ai_status: non avendo un canale su cui
+        # ricevere eventi, gli si tiene pronta una fotografia
+        self._control_session = {
+            "phase": "idle",
+            "text": "",
+            "error": "",
+            "request_id": "",
+            "options": [],
+            "executed": "",
+            "output": "",
+            "seq": 0,
+        }
+        # la dettatura in corso e' stata avviata dal pannello sul PC: il
+        # testo trascritto va interpretato per lui (vedi _control_ai_worker)
+        # invece di essere eseguito subito come per il telefono
+        self._recording_from_control = False
         # file handle del lock di istanza singola, assegnato dall'esterno
         # (vedi if __name__ == "__main__"): serve a _request_restart per
         # rilasciarlo prima di rieseguire il processo con execv
@@ -1120,14 +2098,34 @@ class Stenografa:
                 kind = item[0]
                 if kind == "toggle":
                     self.toggle_recording()
+                elif kind == "wake":
+                    self._on_wake_word(item[1])
+                elif kind == "wake_heard":
+                    self._on_wake_heard(item[1])
                 elif kind == "button":
-                    self._handle_button_press(item[1])
+                    # gli elementi in coda (origine del comando, chi
+                    # trascrive, chi registra) mancano quando la pressione
+                    # arriva dal socket locale o da una versione precedente
+                    # dell'app
+                    source = item[2] if len(item) > 2 else None
+                    transcribe = item[3] if len(item) > 3 else None
+                    mic = item[4] if len(item) > 4 else None
+                    self._handle_button_press(
+                        item[1], source=source, transcribe=transcribe, mic=mic
+                    )
                 elif kind == "button_down":
-                    self._handle_button_press(item[1], phase="down")
+                    mic = item[2] if len(item) > 2 else None
+                    self._handle_button_press(item[1], phase="down", mic=mic)
                 elif kind == "button_up":
                     self._handle_button_press(item[1], phase="up")
                 elif kind == "recording_timeout":
                     self._on_recording_timeout_reached()
+                elif kind == "dictated_text":
+                    self._on_dictated_text(item[1])
+                elif kind == "silence_timeout":
+                    self._on_silence_timeout_reached(item[1])
+                elif kind == "phone_audio_lost":
+                    self._on_phone_audio_lost()
                 elif kind == "paste_history":
                     self._paste_history_entry(item[1])
                 elif kind == "player_action":
@@ -1146,6 +2144,10 @@ class Stenografa:
                     self._on_ai_choice_reply(item[1], item[2], item[3], item[4])
                 elif kind == "ai_choice_cancel":
                     self._cancel_pending_choice(item[1], reason="cancelled")
+                elif kind == "control_ai_record":
+                    self._on_control_ai_record(item[1])
+                elif kind == "control_ai_ready":
+                    self._set_state(STATE_IDLE)
                 elif kind == "translate_done":
                     self._on_translate_done(item[1], item[2], item[3])
                 elif kind == "quit":
@@ -1170,6 +2172,12 @@ class Stenografa:
     def _set_state(self, state):
         self.state = state
         self._broadcast({"type": "state", "state": state})
+        # riscontro sullo schermo del PC: senza, una dettatura partita a voce
+        # non si vede da nessuna parte (vedi show_dictation_overlay)
+        try:
+            self.backend.show_dictation_overlay(state)
+        except Exception:
+            pass
         if state == STATE_IDLE:
             # fine della dettatura, comunque sia andata (testo incollato,
             # comando eseguito, errore, niente da trascrivere): i video
@@ -1178,6 +2186,13 @@ class Stenografa:
             self._resume_media_after_recording()
 
     def _notify(self, title, body, urgency="normal"):
+        # filtro delle notifiche di sistema (vedi NOTIFICATION_LEVELS): con
+        # "errors" passano solo quelle critiche, con "none" nessuna. Il
+        # _broadcast all'app telefono resta invariato in tutti i casi.
+        if self.notifications == "none":
+            return
+        if self.notifications == "errors" and urgency != "critical":
+            return
         self.backend.notify(title, body, urgency)
 
     # --- configurazione (lingua di dettatura, ripristino appunti) ---
@@ -1193,9 +2208,17 @@ class Stenografa:
             "confirm_before_paste": self.confirm_before_paste,
             "require_tls": self.require_tls,
             "pause_media_while_recording": self.pause_media_while_recording,
+            "notifications": self.notifications,
+            "wake_word_enabled": self.wake_word_enabled,
+            "wake_phrase_start": self.wake_phrase_start,
+            "wake_phrase_stop": self.wake_phrase_stop,
+            "silence_timeout": self.silence_timeout,
             # informativi (non modificabili): servono all'app telefono per
             # mostrare l'impronta da confrontare e capire se il canale e'
             # cifrato
+            # su cosa gira la trascrizione: "cuda" o, se la GPU non e'
+            # utilizzabile, "cpu" (vedi MODEL_FALLBACK_DEVICE)
+            "model_device": self.model.device,
             "tls_available": self.tls_context is not None,
             "tls_fingerprint": self.tls_fingerprint,
         }
@@ -1225,6 +2248,89 @@ class Stenografa:
             return False, "pause_media_while_recording deve essere un booleano"
         self.pause_media_while_recording = enabled
         _save_pause_media_while_recording(enabled)
+        self._broadcast({"type": "config", **self._config_snapshot()})
+        return True, None
+
+    def _set_wake_word_enabled(self, enabled):
+        if not isinstance(enabled, bool):
+            return False, "wake_word_enabled deve essere un booleano"
+        self.wake_word_enabled = enabled
+        _save_wake_word_enabled(enabled)
+        if enabled:
+            self.wake_listener.start()
+            # se si accende l'ascolto mentre si sta gia' dettando, la sorgente
+            # giusta e' il file della dettatura in corso, non una cattura nuova
+            if self.state == STATE_RECORDING and self.record_file:
+                self.wake_listener.follow_recording(self.record_file)
+        else:
+            self.wake_listener.stop()
+        self._broadcast({"type": "config", **self._config_snapshot()})
+        return True, None
+
+    def _set_silence_timeout(self, seconds):
+        if isinstance(seconds, bool) or not isinstance(seconds, int):
+            return False, "silence_timeout deve essere un numero di secondi"
+        if seconds != 0 and not (
+            SILENCE_TIMEOUT_MIN <= seconds <= SILENCE_TIMEOUT_MAX
+        ):
+            return False, (
+                f"silence_timeout deve essere 0 (spento) oppure fra "
+                f"{SILENCE_TIMEOUT_MIN} e {SILENCE_TIMEOUT_MAX} secondi"
+            )
+        self.silence_timeout = seconds
+        _save_silence_timeout(seconds)
+        # se e' in corso una dettatura, il nuovo valore vale dalla prossima:
+        # cambiare la finestra a meta' registrazione darebbe una chiusura a
+        # sorpresa, calcolata su un silenzio che l'utente non sa di avere
+        self._broadcast({"type": "config", **self._config_snapshot()})
+        return True, None
+
+    def _set_wake_phrase(self, phrase, other, save, attribute, label):
+        """Parte comune delle due frasi di attivazione: la sola differenza fra
+        avvio e stop e' quale delle due si sta cambiando."""
+        if not _valid_wake_phrase(phrase):
+            return False, (
+                f"{label} deve contenere almeno "
+                f"{WAKE_PHRASE_MIN_CHARS} caratteri (lettere o numeri) e non "
+                f"superare i {WAKE_PHRASE_MAX_CHARS}"
+            )
+        phrase = phrase.strip()
+        if _normalize_phrase(phrase) == _normalize_phrase(other):
+            return False, (
+                "le frasi di avvio e di stop devono essere diverse fra loro"
+            )
+        setattr(self, attribute, phrase)
+        save(phrase)
+        self._broadcast({"type": "config", **self._config_snapshot()})
+        return True, None
+
+    def _set_wake_phrase_start(self, phrase):
+        return self._set_wake_phrase(
+            phrase,
+            self.wake_phrase_stop,
+            _save_wake_phrase_start,
+            "wake_phrase_start",
+            "wake_phrase_start",
+        )
+
+    def _set_wake_phrase_stop(self, phrase):
+        return self._set_wake_phrase(
+            phrase,
+            self.wake_phrase_start,
+            _save_wake_phrase_stop,
+            "wake_phrase_stop",
+            "wake_phrase_stop",
+        )
+
+    def _set_notifications(self, level):
+        if not _valid_notifications(level):
+            return False, (
+                "notifications deve essere uno fra "
+                + ", ".join(f"'{lv}'" for lv in NOTIFICATION_LEVELS)
+            )
+        level = level.strip().lower()
+        self.notifications = level
+        _save_notifications(level)
         self._broadcast({"type": "config", **self._config_snapshot()})
         return True, None
 
@@ -1512,19 +2618,55 @@ class Stenografa:
                     continue
 
                 if cmd == "toggle":
-                    self.command_queue.put(("button", "record"))
+                    self.command_queue.put(("button", "record", msg.get("source")))
                 elif cmd == "button":
-                    self.command_queue.put(("button", msg.get("id")))
+                    # "source": "wake" quando a premere il pulsante e' stata
+                    # l'attivazione vocale del telefono e non un dito. Serve al
+                    # demone per sapere che nell'audio ci sono anche le frasi
+                    # di attivazione, da suggerire al modello e da togliere dal
+                    # testo (vedi _vocabulary_for_dashboard/_strip_wake_phrases).
+                    # Campo opzionale: le versioni precedenti dell'app non lo
+                    # mandano e continuano a funzionare.
+                    if msg.get("mic") == "phone":
+                        # chi chiede di registrare col proprio microfono e'
+                        # anche chi mandera' l'audio: va ricordato per
+                        # accorgersi se sparisce a meta' dettatura
+                        self._phone_audio_conn = conn
+                    self.command_queue.put(
+                        (
+                            "button",
+                            msg.get("id"),
+                            msg.get("source"),
+                            msg.get("transcribe"),
+                            msg.get("mic"),
+                        )
+                    )
                 elif cmd == "button_down":
                     # push-to-talk: pressione e rilascio arrivano separati,
                     # invece del singolo tocco che fa da interruttore
-                    self.command_queue.put(("button_down", msg.get("id")))
+                    if msg.get("mic") == "phone":
+                        self._phone_audio_conn = conn
+                    self.command_queue.put(
+                        ("button_down", msg.get("id"), msg.get("mic"))
+                    )
                 elif cmd == "button_up":
                     self.command_queue.put(("button_up", msg.get("id")))
                 elif cmd == "list_apps":
                     self._send_to(
                         conn, {"type": "apps", "apps": self._list_apps_cached()}
                     )
+                elif cmd == "dictated_text":
+                    # il telefono ha trascritto per conto suo e consegna il
+                    # testo: vale anche come "ferma la dettatura"
+                    self.command_queue.put(("dictated_text", msg.get("text")))
+                elif cmd == "audio":
+                    # un blocco del microfono del telefono: si scrive subito,
+                    # qui nel thread del socket, invece di accodarlo. Sono una
+                    # decina di messaggi al secondo per tutta la durata della
+                    # dettatura, e passare dalla coda dei comandi vorrebbe dire
+                    # occupare il thread principale con quello che e' solo I/O
+                    # su file, rallentando le transizioni di stato.
+                    self._append_phone_audio(msg.get("data"))
                 elif cmd == "get_history":
                     self._send_to(
                         conn, {"type": "history", "items": self._history_snapshot()}
@@ -1586,6 +2728,9 @@ class Stenografa:
         finally:
             with self._net_lock:
                 self._net_clients.discard(conn)
+            if self._phone_audio_conn is conn:
+                self._phone_audio_conn = None
+                self.command_queue.put(("phone_audio_lost",))
             try:
                 conn.close()
             except OSError:
@@ -2554,13 +3699,20 @@ class Stenografa:
         self._broadcast_layout()
         return True, None
 
-    def _handle_button_press(self, button_id, phase="tap"):
+    def _handle_button_press(
+        self, button_id, phase="tap", source=None, transcribe=None, mic=None
+    ):
         """`phase` distingue il tocco normale ("tap", che sui pulsanti
         microfono fa da interruttore avvia/ferma) dal push-to-talk, in cui
         l'app invia separatamente la pressione ("down", avvia) e il rilascio
         ("up", ferma). Sui pulsanti non-microfono l'azione parte alla
         pressione e il rilascio non fa nulla, cosi' tenere premuto per
-        sbaglio non la esegue due volte."""
+        sbaglio non la esegue due volte.
+
+        `source` vale "wake" quando il pulsante e' stato premuto
+        dall'attivazione vocale del telefono: la dettatura contiene allora
+        anche le frasi pronunciate, da trattare come quando ad ascoltare e' il
+        PC (vedi _recording_from_wake)."""
         with self._layout_lock:
             dashboard, button = self._find_button_global(button_id)
         if button is None:
@@ -2571,6 +3723,19 @@ class Stenografa:
         if kind in MIC_KINDS:
             mode = "ai_command" if kind == "ai_command" else "paste"
             auto_enter = bool(button.get("auto_enter"))
+            # va deciso prima di avviare: _start_recording costruisce subito
+            # il vocabolario da passare al modello. Una frase di stop detta a
+            # voce vale anche se la dettatura era stata avviata col dito: in
+            # quel caso l'audio la contiene comunque, e va tolta dal testo.
+            if source == "wake":
+                self._recording_from_wake = True
+            elif self.state == STATE_IDLE:
+                self._recording_from_wake = False
+            # chi trascrive e chi registra si decidono all'avvio e valgono
+            # per tutta la dettatura
+            if self.state == STATE_IDLE:
+                self._recording_by_phone = transcribe == "phone"
+                self._recording_mic_from_phone = mic == "phone"
             if phase == "down":
                 # gia' in registrazione: il "down" e' un doppione (es. due
                 # telefoni collegati), non un secondo comando da eseguire
@@ -2979,6 +4144,23 @@ class Stenografa:
                 reply = {"ok": True, "apps": self._list_apps_cached()}
             elif cmd == "launch_app":
                 reply = self._handle_launch_app(msg.get("id"))
+            elif cmd == "ai_command":
+                reply = self._handle_control_ai_command(
+                    msg.get("text"), msg.get("dashboard_id")
+                )
+            elif cmd == "ai_record":
+                reply = self._handle_control_ai_record(msg.get("dashboard_id"))
+            elif cmd == "ai_status":
+                reply = self._handle_control_ai_status()
+            elif cmd == "ai_cancel":
+                reply = self._handle_control_ai_cancel()
+            elif cmd == "ai_choose":
+                reply = self._handle_control_ai_choose(
+                    msg.get("request_id"),
+                    msg.get("index"),
+                    msg.get("delay_ms"),
+                    bool(msg.get("confirm_shell")),
+                )
             elif cmd in CONFIG_CMDS:
                 ok, error = self._handle_config_cmd(cmd, msg)
                 reply = {"ok": ok}
@@ -3038,6 +4220,56 @@ class Stenografa:
         # se sta caricando, trascrivendo o elaborando un comando IA, ignora
         # il toggle
 
+    def _on_model_fallback(self, error):
+        """La trascrizione e' ripiegata sulla CPU (vedi
+        MODEL_FALLBACK_DEVICE). Va detto: la dettatura continua a funzionare
+        ma diventa parecchio piu' lenta, e senza un avviso sembrerebbe solo
+        che il PC si e' impallato."""
+        self._notify(
+            "Stenografa - trascrizione su CPU",
+            "La GPU non e' utilizzabile, si continua sulla CPU: la "
+            "trascrizione sara' piu' lenta. " + error,
+            urgency="critical",
+        )
+        self._broadcast({"type": "config", **self._config_snapshot()})
+
+    def _on_wake_heard(self, text):
+        """Quello che il microfono del PC ha capito, che sia servito o no.
+
+        Va mostrato all'utente: se la sua frase non fa scattare niente, questo
+        e' l'unico modo di scoprire come viene sentita davvero — e quindi di
+        aggiungerla come variante (vedi _phrase_variants)."""
+        text = (text or "").strip()
+        if not text or text == self.wake_heard:
+            return
+        self.wake_heard = text
+        self._broadcast({"type": "wake_heard", "text": text})
+
+    def _on_wake_word(self, action):
+        """Frase di attivazione riconosciuta (vedi WakeWordListener), eseguita
+        nel thread principale come ogni altro comando.
+
+        Passa dal toggle normale, cosi' la dettatura per voce si comporta in
+        tutto e per tutto come quella avviata dal pulsante: pausa dei video,
+        rete di sicurezza sulla durata, vocabolario, notifiche.
+
+        Lo stato viene ricontrollato qui perche' fra il riconoscimento e
+        l'esecuzione puo' essere cambiato (l'utente ha toccato il pulsante nel
+        frattempo): una frase di avvio a registrazione gia' partita non deve
+        fermarla, sarebbe l'opposto di quello che l'utente ha chiesto."""
+        if action == "start" and self.state == STATE_IDLE:
+            self.toggle_recording()
+        elif action == "stop" and self.state == STATE_RECORDING:
+            self._stop_recording_and_transcribe()
+
+    @property
+    def _wake_phrases_in_audio(self):
+        """True se nell'audio della dettatura ci sono anche le frasi di
+        attivazione: succede sia quando ad ascoltare e' il PC, sia quando la
+        dettatura e' stata avviata a voce dal telefono (che sente la frase
+        mentre il microfono del PC la sta gia' registrando)."""
+        return self.wake_word_enabled or self._recording_from_wake
+
     def _vocabulary_for_dashboard(self, dashboard_id):
         """Contesto da passare a Whisper come `initial_prompt`: il
         vocabolario globale piu' quello della dashboard da cui parte la
@@ -3054,6 +4286,15 @@ class Stenografa:
                 specific = (dashboard.get("vocabulary") or "").strip()
                 if specific:
                     parts.append(specific)
+        # con l'attivazione vocale accesa le frasi finiscono anche nella
+        # dettatura vera, e vanno tolte dal testo (vedi _strip_wake_phrases).
+        # Perche' sia possibile riconoscerle bisogna prima che il modello le
+        # scriva come l'utente le ha configurate: senza questo suggerimento un
+        # "Jarvis stop" detto in italiano diventa "già visto" e resta nel testo.
+        if self._wake_phrases_in_audio:
+            prompt = _wake_prompt(self.wake_phrase_start, self.wake_phrase_stop)
+            if prompt:
+                parts.append(prompt.rstrip("."))
         if not parts:
             return ""
         return "Termini ricorrenti: " + "; ".join(parts) + "."
@@ -3080,10 +4321,34 @@ class Stenografa:
         # riproduzione finirebbe nella dettatura (vedi
         # pause_media_while_recording)
         self._pause_media_for_recording()
-        self.backend.start_recording(path)
-        # il modello si carica mentre l'utente parla, cosi' allo stop e'
-        # gia' pronto e la trascrizione parte subito
-        self.model.preload()
+        if self._recording_by_phone:
+            # trascrive il telefono, col proprio microfono: aprire anche
+            # quello del PC servirebbe solo a tenere occupata la scheda audio
+            # e a registrare un file che nessuno leggerebbe. Il testo arrivera'
+            # gia' pronto (vedi _on_dictated_text).
+            self.record_file = None
+            os.unlink(path)
+        elif self._recording_mic_from_phone:
+            # registra il telefono, trascrive il PC: i blocchi audio arrivano
+            # dal socket e finiscono in questo stesso file (vedi
+            # _append_phone_audio), che da qui in poi e' identico a quello che
+            # avrebbe scritto pw-record.
+            #
+            # Il microfono del PC non si apre: e' esattamente il motivo per cui
+            # questa modalita' esiste. Per lo stesso motivo niente
+            # follow_recording, che serve solo a non tenere due catture aperte
+            # sul microfono del PC.
+            self._phone_audio = PhoneAudioSink(path)
+            self.model.preload()
+        else:
+            # prima di aprire il microfono della dettatura: l'ascolto chiude la
+            # propria cattura e passa a leggere questo stesso file, cosi' non ci
+            # sono mai due catture aperte insieme (vedi WakeWordListener)
+            self.wake_listener.follow_recording(path)
+            self.backend.start_recording(path)
+            # il modello si carica mentre l'utente parla, cosi' allo stop e'
+            # gia' pronto e la trascrizione parte subito
+            self.model.preload()
         self._set_state(STATE_RECORDING)
         self._cancel_recording_watchdog()
         if phase != "down":
@@ -3098,11 +4363,160 @@ class Stenografa:
             timer.daemon = True
             timer.start()
             self._recording_watchdog_timer = timer
+            if not self._recording_by_phone:
+                # il controllo del silenzio guarda il file della dettatura, che
+                # quando trascrive il telefono non esiste: li' a chiudere ci
+                # pensa il telefono. Con il solo microfono di rete il file c'e'
+                # e cresce, quindi il controllo funziona come sempre.
+                self._start_silence_watchdog(path)
 
     def _cancel_recording_watchdog(self):
         if self._recording_watchdog_timer is not None:
             self._recording_watchdog_timer.cancel()
             self._recording_watchdog_timer = None
+        self._stop_silence_watchdog()
+
+    # --- chiusura automatica sul silenzio ---
+    # Guarda la coda del file che la dettatura sta scrivendo: quando in quella
+    # finestra non c'e' piu' parlato, chiude e fa trascrivere. Legge lo stesso
+    # file della registrazione, senza aprire un secondo microfono — la stessa
+    # strada dell'ascolto della frase di stop (vedi WakeWordListener).
+
+    def _start_silence_watchdog(self, wav_path):
+        if not self.silence_timeout:
+            return
+        stop = threading.Event()
+        self._silence_stop = stop
+        thread = threading.Thread(
+            target=self._silence_worker,
+            args=(wav_path, self.silence_timeout, stop),
+            daemon=True,
+        )
+        self._silence_thread = thread
+        thread.start()
+
+    def _stop_silence_watchdog(self):
+        stop = getattr(self, "_silence_stop", None)
+        if stop is not None:
+            stop.set()
+        self._silence_stop = None
+        self._silence_thread = None
+
+    def _silence_worker(self, wav_path, timeout, stop):
+        # finche' non si e' sentita almeno una parola non si chiude niente:
+        # fra il tocco sul pulsante e l'inizio del discorso puo' passare
+        # parecchio — ci si avvicina al microfono, si pensa a cosa dire — e
+        # chiudere li' vorrebbe dire buttare via una dettatura mai cominciata,
+        # restituendo un "Nessun testo rilevato" che sembra un guasto. A una
+        # registrazione lasciata aperta per sbaglio pensa gia' la rete di
+        # sicurezza sulla durata (RECORDING_MAX_DURATION_SECONDS).
+        heard_voice = False
+        while not stop.wait(SILENCE_CHECK_INTERVAL):
+            try:
+                if not os.path.exists(wav_path):
+                    return
+                if not heard_voice:
+                    # si guarda solo l'ultimo tratto: basta accorgersi che
+                    # qualcuno ha cominciato a parlare
+                    recent = _read_wav_tail(wav_path, SILENCE_CHECK_INTERVAL * 2)
+                    spoken = _speech_seconds(recent)
+                    if spoken is None:
+                        # senza rilevatore di voce non si puo' sapere quando
+                        # si e' cominciato: si torna a contare dall'inizio
+                        heard_voice = True
+                    elif spoken > 0:
+                        heard_voice = True
+                    continue
+                if _tail_is_silent(wav_path, timeout):
+                    # la decisione la prende il thread principale: qui si
+                    # segnala soltanto, come per ogni altro comando
+                    self.command_queue.put(("silence_timeout", wav_path))
+                    return
+            except Exception:
+                # un errore di lettura non deve interrompere la dettatura:
+                # al massimo resta aperta come prima di questa funzione
+                return
+
+    def _on_dictated_text(self, text):
+        """Il telefono ha trascritto per conto suo e consegna il testo (vedi
+        _recording_by_phone). Vale anche come "ferma la dettatura": arriva un
+        messaggio solo, cosi' non resta uno stato appeso ad aspettare il testo
+        se l'app viene chiusa a meta'.
+
+        Da qui in poi il percorso e' quello di sempre — traduzione, conferma,
+        incolla, storico — perche' cambia solo *chi* ha trascritto."""
+        if self.state != STATE_RECORDING or not self._recording_by_phone:
+            return
+        self._cancel_recording_watchdog()
+        text = (text or "").strip()
+        if text and self._wake_phrases_in_audio:
+            # se la dettatura e' stata avviata o fermata a voce, il
+            # riconoscitore del telefono ha sentito anche le frasi di
+            # attivazione: si tolgono con lo stesso criterio usato sul testo
+            # trascritto dal PC
+            text = _strip_wake_phrases(
+                text, self.wake_phrase_start, self.wake_phrase_stop
+            )
+        self._on_transcription_done(text or None, None)
+
+    def _append_phone_audio(self, data):
+        """Un blocco del microfono del telefono: base64 di PCM a 16 kHz, mono,
+        16 bit — lo stesso formato che pw-record produce sul PC.
+
+        Chiamato dal thread del socket. Se non c'e' nessun file aperto il
+        blocco si scarta in silenzio: sono i frammenti ancora in volo quando la
+        dettatura e' gia' stata chiusa (dal pulsante, dal silenzio o dalla rete
+        di sicurezza sulla durata), e non c'e' niente di sbagliato da
+        segnalare."""
+        sink = self._phone_audio
+        if sink is None or not data:
+            return
+        try:
+            pcm = base64.b64decode(data, validate=True)
+        except Exception:
+            # un blocco malformato non deve far cadere la connessione: al
+            # massimo nella dettatura mancheranno cento millisecondi
+            return
+        sink.append(pcm)
+
+    def _close_phone_audio(self):
+        """Chiude il file alimentato dal telefono, se ce n'e' uno aperto."""
+        sink = self._phone_audio
+        self._phone_audio = None
+        self._phone_audio_conn = None
+        if sink is not None:
+            sink.close()
+
+    def _on_phone_audio_lost(self):
+        """Il telefono che stava registrando si e' disconnesso a meta'
+        dettatura: nessun altro riempira' il file. Si trascrive quello che e'
+        arrivato, come per il silenzio prolungato — meglio di una dettatura
+        che resta aperta ad aspettare audio che non arrivera' mai."""
+        if self.state != STATE_RECORDING or not self._recording_mic_from_phone:
+            return
+        self._notify(
+            "Stenografa - dettatura chiusa",
+            "Il telefono che stava registrando si e' disconnesso: "
+            "trascrivo quello che ho ricevuto.",
+        )
+        self._stop_recording_and_transcribe()
+
+    def _on_silence_timeout_reached(self, wav_path):
+        """Silenzio prolungato durante la dettatura: si chiude e si trascrive
+        quello che si e' raccolto.
+
+        Si ricontrolla che sia ancora la stessa registrazione: fra il momento
+        in cui il silenzio e' stato rilevato e questo istante l'utente puo'
+        aver gia' fermato tutto, e una nuova dettatura potrebbe essere
+        partita."""
+        if self.state != STATE_RECORDING or self.record_file != wav_path:
+            return
+        self._notify(
+            "Stenografa - dettatura chiusa",
+            f"Nessuna voce per {self.silence_timeout} secondi: "
+            "trascrivo quello che ho sentito.",
+        )
+        self._stop_recording_and_transcribe()
 
     def _on_recording_timeout(self):
         """Chiamato dal thread del timer quando la registrazione a
@@ -3133,6 +4547,12 @@ class Stenografa:
         path = self.record_file
         self.record_file = None
         self.backend.stop_recording()
+        # se a riempire il file era il telefono, l'header va corretto adesso:
+        # la trascrizione parte subito dopo
+        self._close_phone_audio()
+        # il file della dettatura sta per essere consumato e cancellato:
+        # l'ascolto torna alla propria cattura, in attesa della frase di avvio
+        self.wake_listener.follow_own_capture()
 
         self._set_state(
             STATE_TRANSCRIBING if self.model.is_loaded else STATE_LOADING
@@ -3163,6 +4583,12 @@ class Stenografa:
                     task="translate" if use_whisper_translate else "transcribe",
                     initial_prompt=self._recording_vocabulary,
                 )
+                if self._wake_phrases_in_audio and text:
+                    # il modello della dettatura trascrive anche le frasi di
+                    # attivazione, che l'utente non intendeva dettare
+                    text = _strip_wake_phrases(
+                        text, self.wake_phrase_start, self.wake_phrase_stop
+                    )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -3182,6 +4608,16 @@ class Stenografa:
         self._set_state(STATE_IDLE)
         mode = self._recording_mode
         self._recording_mode = "paste"
+        # la dettatura era stata chiesta dal pannello sul PC: l'esito e' suo
+        # e non va eseguito d'iniziativa (vedi _control_ai_worker)
+        from_control = self._recording_from_control
+        self._recording_from_control = False
+        # valgono per la dettatura appena finita: la prossima potrebbe
+        # partire da un dito, o toccare al PC trascrivere (vedi
+        # _handle_button_press)
+        self._recording_from_wake = False
+        self._recording_by_phone = False
+        self._recording_mic_from_phone = False
         dashboard_id = self._recording_dashboard_id
         self._recording_dashboard_id = None
         # l'invio automatico vale per questa dettatura, non per il
@@ -3191,14 +4627,32 @@ class Stenografa:
         clipboard_before = self._clipboard_before
         self._clipboard_before = None
         if error:
+            if from_control:
+                self._set_control_session(phase="error", error=error)
             self._notify("Stenografa - errore", error, urgency="critical")
             self._broadcast({"type": "result", "text": None, "error": error})
             return
         if not text:
+            if from_control:
+                self._set_control_session(
+                    phase="error", error="Nessun testo rilevato."
+                )
             self._notify("Stenografa", "Nessun testo rilevato.")
             self._broadcast(
                 {"type": "result", "text": None, "error": "Nessun testo rilevato."}
             )
+            return
+        if mode == "ai_command" and from_control:
+            # stesso trattamento del ramo qui sotto (chiamata bloccante in
+            # un thread), ma l'esito torna al pannello sul PC invece di
+            # essere eseguito subito
+            self._set_control_session(phase="thinking", text=text)
+            self._set_state(STATE_THINKING)
+            threading.Thread(
+                target=self._control_ai_worker,
+                args=(text, dashboard_id),
+                daemon=True,
+            ).start()
             return
         if mode == "ai_command":
             # l'interpretazione LLM e' una chiamata di rete bloccante: gira
@@ -3571,7 +5025,7 @@ class Stenografa:
             "generica del comando."
         )
 
-    def _parse_shortcut_candidates(self, raw, allow_macro=False):
+    def _parse_shortcut_candidates(self, raw, allow_macro=False, allow_shell=False):
         """Estrae dalla risposta dell'LLM la lista di candidati
         {"label", "combo"} (o {"label", "combos"} per una macro, solo se
         `allow_macro`, vedi _interpret_as_shortcuts). Volutamente
@@ -3606,13 +5060,17 @@ class Stenografa:
                 # un nome, la risoluzione all'id vero avviene qui contro
                 # l'elenco delle app installate (vedi _resolve_app_candidates)
                 entries = self._resolve_app_candidates(spec.get("app"), spec.get("label"))
+            elif allow_shell and isinstance(spec, dict) and spec.get("shell"):
+                entries = self._resolve_shell_candidate(spec)
             elif allow_macro and isinstance(spec, dict) and spec.get("combos"):
                 entries = self._resolve_macro_candidate(spec)
             else:
                 entry, error = self._validate_shortcut_spec(spec, i)
                 entries = [] if error else [entry]
             for entry in entries:
-                if entry.get("combos"):
+                if entry.get("shell"):
+                    key = "shell:" + "\n".join(entry["shell"])
+                elif entry.get("combos"):
                     key = "macro:" + ">".join(entry["combos"])
                 else:
                     key = entry.get("combo") or f"app:{entry.get('app_id')}"
@@ -3677,6 +5135,79 @@ class Stenografa:
             return []
         return [{"label": label, "combos": combos, "delay_ms": delay_ms}]
 
+    def _resolve_shell_candidate(self, spec):
+        """Valida un candidato "comando da terminale" (campo "shell", vedi
+        AI_COMMAND_SHELL_PROMPT). Accetta sia una stringa sola sia un array
+        di comandi e normalizza sempre in lista: il pannello di conferma li
+        mostra una riga per comando, ed eseguirli in sequenza nella stessa
+        shell e' l'unico modo perche' un "cd" valga anche per i successivi.
+
+        Scartato singolarmente se malformato, come gli altri candidati. Qui
+        non si giudica cosa faccia il comando — quello lo fa l'utente
+        leggendolo nel pannello — ma solo che sia mostrabile: niente
+        comandi vuoti, niente elenchi sterminati, niente righe lunghe come
+        un paragrafo."""
+        label = str(spec.get("label") or "").strip()
+        if not label:
+            return []
+        raw = spec.get("shell")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list) or not raw:
+            return []
+        if len(raw) > CONTROL_SHELL_MAX_COMMANDS:
+            return []
+        commands = []
+        for item in raw:
+            if not isinstance(item, str):
+                return []
+            # una riga per comando: un candidato che nasconde altre righe
+            # dentro una stringa sola sarebbe confermato senza essere letto
+            command = item.strip()
+            if not command or "\n" in command or len(command) > CONTROL_SHELL_MAX_LENGTH:
+                return []
+            commands.append(command)
+        return [{"label": label, "shell": commands}]
+
+    def _run_shell_candidate(self, candidate):
+        """Esegue i comandi di un candidato shell gia' confermato
+        dall'utente. Una sola shell per tutti i comandi (con `set -e`, cosi'
+        il primo che fallisce ferma la sequenza): e' quello che rende utile
+        un "cd" come primo passo, e corrisponde a quello che l'utente ha
+        letto nel pannello.
+
+        Ritorna (descrizione, output, errore)."""
+        commands = candidate.get("shell") or []
+        description = " ; ".join(commands)
+        if sys.platform == "win32":
+            # il resto del demone gira anche su Windows, questa parte no:
+            # meglio dirlo che tradurre alla cieca comandi bash in cmd
+            return description, "", "comandi da terminale non supportati su Windows"
+        script = "set -e\n" + "\n".join(commands)
+        try:
+            # shell di login: senza il profilo dell'utente mancherebbero
+            # PATH e simili, e comandi che nel suo terminale funzionano qui
+            # fallirebbero senza un motivo comprensibile
+            proc = subprocess.run(
+                ["bash", "-lc", script],
+                cwd=str(Path.home()),
+                capture_output=True,
+                text=True,
+                timeout=CONTROL_SHELL_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return description, "", (
+                f"comando interrotto dopo {CONTROL_SHELL_TIMEOUT}s"
+            )
+        except OSError as exc:
+            return description, "", f"impossibile eseguire il comando: {exc}"
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if len(output) > CONTROL_SHELL_OUTPUT_CHARS:
+            output = output[:CONTROL_SHELL_OUTPUT_CHARS] + "\n[…]"
+        if proc.returncode != 0:
+            return description, output, f"uscito con codice {proc.returncode}"
+        return description, output, None
+
     def _execute_candidate(self, candidate):
         """Esegue un'opzione proposta dal comando vocale IA: una
         combinazione di tasti, una macro (piu' combinazioni in sequenza)
@@ -3723,7 +5254,7 @@ class Stenografa:
                 return i
         return None
 
-    def _interpret_as_shortcuts(self, text, dashboard_id=None):
+    def _interpret_as_shortcuts(self, text, dashboard_id=None, allow_shell=False):
         """Chiede al backend LLM configurato (vedi llm_provider) di tradurre
         `text` (la frase dettata) in una o piu' combinazioni plausibili. Se
         `dashboard_id` e' indicato, da' priorita' alle scorciatoie gia'
@@ -3731,7 +5262,11 @@ class Stenografa:
         Chiamata di rete bloccante: va eseguita in un thread separato (vedi
         _ai_command_worker). Ritorna (candidati, errore): solo uno dei due
         e' valorizzato. Un solo candidato = comando chiaro, si esegue
-        subito; piu' candidati = comando ambiguo, sceglie l'utente."""
+        subito; piu' candidati = comando ambiguo, sceglie l'utente.
+
+        `allow_shell` aggiunge ai candidati possibili i comandi da terminale
+        (vedi AI_COMMAND_SHELL_PROMPT): lo passa solo il comando IA arrivato
+        dal socket di controllo, che li mostra e li fa confermare."""
         # il nome della dashboard abilita la generazione di macro
         # (AI_COMMAND_MACRO_PROMPT_TEMPLATE) e la vincola a quell'app: senza
         # una dashboard nota non si generano macro, solo singole
@@ -3740,6 +5275,8 @@ class Stenografa:
         system_prompt = AI_COMMAND_SYSTEM_PROMPT
         if dashboard_name:
             system_prompt += AI_COMMAND_MACRO_PROMPT_TEMPLATE.format(name=dashboard_name)
+        if allow_shell:
+            system_prompt += AI_COMMAND_SHELL_PROMPT
         if dashboard_id:
             system_prompt += self._dashboard_shortcuts_context(dashboard_id)
         # un array JSON di candidati (specie con macro multi-passo) non sta
@@ -3750,7 +5287,9 @@ class Stenografa:
         if error:
             return None, error
 
-        candidates = self._parse_shortcut_candidates(reply, allow_macro=bool(dashboard_name))
+        candidates = self._parse_shortcut_candidates(
+            reply, allow_macro=bool(dashboard_name), allow_shell=allow_shell
+        )
         if not candidates:
             return None, f"comando vocale non riconosciuto: \"{text}\""
         return candidates, None
@@ -3788,6 +5327,280 @@ class Stenografa:
                 "error": error,
             }
         )
+
+    # --- comando IA dal socket di controllo (dashboard sul PC) ---
+    # Stesso motore del comando vocale del telefono — stesso microfono,
+    # stesso Whisper, stesso backend LLM — ma innescato da una finestra
+    # sullo stesso PC. Due differenze cambiano il flusso:
+    #
+    #   * il fuoco della tastiera ce l'ha chi ha premuto il pulsante, quindi
+    #     qui non si esegue mai nulla di propria iniziativa: il demone
+    #     interpreta e parcheggia le opzioni, il pannello si toglie di mezzo
+    #     e poi chiama ai_choose;
+    #   * chi guarda ha uno schermo davanti, quindi puo' leggere e
+    #     confermare un comando da terminale (vedi AI_COMMAND_SHELL_PROMPT),
+    #     cosa che al telefono non viene mai proposta.
+    #
+    # Il pannello non ha un canale su cui ricevere notifiche: segue la
+    # sessione interrogando ai_status (vedi _control_session_snapshot).
+
+    def _set_control_session(self, **fields):
+        """Aggiorna la sessione del comando IA in corso sul PC. `seq` cresce
+        a ogni modifica: e' quello che permette al pannello di accorgersi
+        che qualcosa e' cambiato senza confrontare tutto il resto."""
+        with self._control_choice_lock:
+            session = dict(self._control_session)
+            session.update(fields)
+            session["seq"] = self._control_session["seq"] + 1
+            self._control_session = session
+
+    def _reset_control_session(self, phase="idle"):
+        with self._control_choice_lock:
+            self._control_session = {
+                "phase": phase,
+                "text": "",
+                "error": "",
+                "request_id": "",
+                "options": [],
+                "executed": "",
+                "output": "",
+                "seq": self._control_session["seq"] + 1,
+            }
+            # le opzioni di una sessione precedente non sono piu' a video
+            self._control_choice = None
+
+    def _control_session_snapshot(self):
+        with self._control_choice_lock:
+            return dict(self._control_session)
+
+    def _park_control_choice(self, text, candidates):
+        """Mette le opzioni interpretate in attesa di una scelta e ritorna
+        il request_id con cui richiamarle. Nessuna viene eseguita: e' il
+        punto in cui il flusso del PC si separa da quello del telefono, che
+        invece esegue subito quando il candidato e' uno solo."""
+        request_id = secrets.token_hex(8)
+        with self._control_choice_lock:
+            # una nuova richiesta sostituisce la precedente: le opzioni di
+            # prima non sono piu' sotto gli occhi di nessuno
+            self._control_choice = {
+                "id": request_id,
+                "text": text,
+                "options": candidates,
+                "expires_at": time.monotonic() + AI_COMMAND_CHOICE_TIMEOUT,
+            }
+        return request_id
+
+    def _handle_control_ai_record(self, dashboard_id=None):
+        """Avvia (o ferma) la dettatura di un comando IA chiesta dal
+        pannello sul PC: il pulsante fa da interruttore, un tocco per
+        parlare e uno per finire. Lo stop automatico sul silenzio configurato
+        nel demone continua a valere, quindi il secondo tocco e' facoltativo.
+
+        La registrazione vera parte dal loop principale (vedi
+        _on_control_ai_record): microfono e stato non si toccano dal thread
+        di una connessione."""
+        if self.state == STATE_RECORDING:
+            if not self._recording_from_control:
+                # dettatura avviata dal telefono: fermarla da qui
+                # consegnerebbe il testo a un pannello che non l'ha chiesto
+                return {
+                    "ok": False,
+                    "error": "e' in corso una dettatura avviata dal telefono",
+                }
+            self._set_control_session(phase="transcribing")
+            self.command_queue.put(("control_ai_record", dashboard_id))
+            return {"ok": True, "state": "transcribing"}
+        if self.state != STATE_IDLE:
+            return {"ok": False, "error": "il demone e' occupato, riprova fra un istante"}
+        self._reset_control_session(phase="recording")
+        self.command_queue.put(("control_ai_record", dashboard_id))
+        # il seq della sessione appena aperta: chi si mette a seguirla lo usa
+        # per non scambiare l'esito di quella precedente per il proprio
+        return {
+            "ok": True,
+            "state": "recording",
+            "seq": self._control_session_snapshot()["seq"],
+        }
+
+    def _on_control_ai_record(self, dashboard_id=None):
+        """Meta' della registrazione eseguita sul loop principale, dove
+        vivono stato e microfono."""
+        if self.state == STATE_RECORDING:
+            self.toggle_recording(mode="ai_command", dashboard_id=dashboard_id)
+            return
+        if self.state != STATE_IDLE:
+            # nel frattempo il demone si e' messo a fare altro: la sessione
+            # appena aperta non avra' mai un seguito, meglio dirlo subito
+            self._set_control_session(
+                phase="error", error="il demone e' occupato, riprova fra un istante"
+            )
+            return
+        self._recording_from_control = True
+        self.toggle_recording(mode="ai_command", dashboard_id=dashboard_id)
+
+    def _control_ai_worker(self, text, dashboard_id=None):
+        """Interpreta la frase dettata dal PC. Gemello di _ai_command_worker,
+        con due differenze volute: i comandi da terminale sono ammessi, e
+        nulla viene eseguito — nemmeno quando il candidato e' uno solo."""
+        candidates, error = self._interpret_as_shortcuts(
+            text, dashboard_id, allow_shell=True
+        )
+        if error:
+            self._set_control_session(phase="error", text=text, error=error)
+        else:
+            request_id = self._park_control_choice(text, candidates)
+            self._set_control_session(
+                phase="choice",
+                text=text,
+                request_id=request_id,
+                options=candidates,
+                error="",
+            )
+        # lo stato torna libero sul loop principale, che e' l'unico a
+        # muoverlo (vedi STATE_THINKING impostato in _on_transcription_done)
+        self.command_queue.put(("control_ai_ready",))
+
+    def _handle_control_ai_status(self):
+        return {
+            "ok": True,
+            "state": self.state,
+            "session": self._control_session_snapshot(),
+        }
+
+    def _handle_control_ai_cancel(self):
+        """Scarta le opzioni in attesa di scelta. Non ferma una dettatura in
+        corso: quella si chiude con lo stesso pulsante che l'ha avviata
+        (ai_record)."""
+        if self.state == STATE_RECORDING:
+            return {
+                "ok": False,
+                "error": "dettatura in corso: fermala con lo stesso pulsante",
+            }
+        self._reset_control_session()
+        return {"ok": True}
+
+    def _handle_control_ai_command(self, text, dashboard_id=None):
+        """Interpreta un comando IA gia' scritto (senza passare dal
+        microfono) e ritorna le opzioni SENZA eseguirne nessuna, come fa la
+        dettatura. Bloccante quanto la chiamata all'LLM: gira nel thread
+        della connessione aperto da _handle_control_client, non nel loop
+        principale."""
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "error": "text mancante"}
+        text = text.strip()
+        if len(text) > CONTROL_AI_MAX_TEXT:
+            return {
+                "ok": False,
+                "error": (
+                    f"text troppo lungo ({len(text)} caratteri, massimo "
+                    f"{CONTROL_AI_MAX_TEXT})"
+                ),
+            }
+        candidates, error = self._interpret_as_shortcuts(
+            text, dashboard_id, allow_shell=True
+        )
+        if error:
+            self._set_control_session(phase="error", text=text, error=error)
+            return {"ok": False, "error": error}
+        request_id = self._park_control_choice(text, candidates)
+        self._set_control_session(
+            phase="choice",
+            text=text,
+            request_id=request_id,
+            options=candidates,
+            error="",
+        )
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "text": text,
+            "options": candidates,
+        }
+
+    def _handle_control_ai_choose(
+        self, request_id, index, delay_ms=None, confirm_shell=False
+    ):
+        """Esegue una delle opzioni proposte da _handle_control_ai_command.
+        Si accetta solo un indice nell'elenco gia' proposto, mai una
+        combinazione arbitraria: come il pannello di scelta del telefono
+        (vedi _on_ai_choice_reply), questo comando non deve diventare una
+        via per far premere al demone qualunque tasto.
+
+        `delay_ms` e' la pausa prima di simulare i tasti: serve a chi ha
+        appena nascosto la propria finestra per restituire il fuoco
+        all'applicazione da comandare, che il compositor non sposta
+        istantaneamente.
+
+        `confirm_shell` deve valere True per eseguire un candidato da
+        terminale: e' la conferma che l'utente ha letto i comandi. Un
+        client che la omette si vede rifiutare l'esecuzione, cosi' la
+        conferma e' parte del protocollo e non una buona intenzione della
+        singola interfaccia."""
+        if delay_ms is None:
+            delay_ms = 0
+        if not isinstance(delay_ms, int) or not (0 <= delay_ms <= MACRO_MAX_DELAY_MS):
+            return {
+                "ok": False,
+                "error": (
+                    f"delay_ms deve essere un intero fra 0 e "
+                    f"{MACRO_MAX_DELAY_MS}"
+                ),
+            }
+        with self._control_choice_lock:
+            pending = self._control_choice
+            if pending is None or pending["id"] != request_id:
+                return {"ok": False, "error": "richiesta sconosciuta o gia' risolta"}
+            if pending["expires_at"] < time.monotonic():
+                self._control_choice = None
+                return {"ok": False, "error": "richiesta scaduta"}
+            if not isinstance(index, int) or not 0 <= index < len(pending["options"]):
+                return {"ok": False, "error": f"index non valido: {index}"}
+            chosen = pending["options"][index]
+            if chosen.get("shell") and not confirm_shell:
+                # la richiesta resta in attesa: il pannello deve mostrare i
+                # comandi e richiamare con la conferma, non ritentare a vuoto
+                return {
+                    "ok": False,
+                    "error": "un comando da terminale richiede una conferma esplicita",
+                    "needs_confirm": True,
+                    "shell": chosen["shell"],
+                }
+            # consumata: una richiesta esegue una sola volta, anche se il
+            # client rimanda lo stesso comando due volte
+            self._control_choice = None
+            text = pending["text"]
+
+        if delay_ms:
+            time.sleep(delay_ms / 1000.0)
+        output = ""
+        if chosen.get("shell"):
+            executed, output, error = self._run_shell_candidate(chosen)
+        else:
+            executed, error = self._execute_candidate(chosen)
+        # niente _broadcast qui: il comando non e' partito dal telefono e un
+        # "result" inatteso li' non descriverebbe nulla che l'utente stia
+        # guardando. La notifica di sistema arriva invece sullo stesso
+        # schermo da cui e' stato dato il comando.
+        if error:
+            self._notify("Stenografa - comando AI", error, urgency="critical")
+        else:
+            self._notify("Stenografa - comando eseguito", f'"{text}" -> {executed}')
+        self._set_control_session(
+            phase="error" if error else "done",
+            text=text,
+            executed=executed,
+            output=output,
+            error=error or "",
+            options=[],
+            request_id="",
+        )
+        return {
+            "ok": True,
+            "text": text,
+            "executed": executed,
+            "output": output,
+            "error": error,
+        }
 
     # --- disambiguazione di un comando vocale ambiguo ---
     # La scelta e' deliberatamente effimera: vive in memoria per qualche
@@ -3898,9 +5711,17 @@ class Stenografa:
         self.command_queue.put(("quit",))
 
     def run(self):
+        if self.wake_word_enabled:
+            self.wake_listener.start()
         try:
             self._main_loop()
         finally:
+            # l'ascolto tiene aperto il microfono: va chiuso per primo,
+            # altrimenti il processo di cattura sopravvive al demone
+            try:
+                self.wake_listener.stop()
+            except Exception:
+                pass
             # se il demone si ferma nel bel mezzo di una dettatura, l'audio
             # silenziato resterebbe muto senza che si capisca perche'
             try:

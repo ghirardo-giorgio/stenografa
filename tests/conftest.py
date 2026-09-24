@@ -31,6 +31,7 @@ def daemon_app(tmp_path, monkeypatch):
     app._net_lock = threading.Lock()
     app.model = daemon_module.ModelManager(language=daemon_module.MODEL_LANGUAGE)
     app.restore_clipboard = False
+    app.notifications = "all"
     app._clipboard_before = None
     app._recording_mode = "paste"
     app._recording_dashboard_id = None
@@ -51,9 +52,42 @@ def daemon_app(tmp_path, monkeypatch):
     app.tls_fingerprint = None
     app._pending_paste = None
     app._pending_choice = None
+    # comando IA chiesto da una dashboard sul PC (socket di controllo)
+    app._control_choice = None
+    app._control_choice_lock = threading.Lock()
+    app._control_session = {
+        "phase": "idle",
+        "text": "",
+        "error": "",
+        "request_id": "",
+        "options": [],
+        "executed": "",
+        "output": "",
+        "seq": 0,
+    }
+    app._recording_from_control = False
     app._history = []
     app._history_lock = threading.Lock()
     app.pause_media_while_recording = False
+    app.wake_word_enabled = False
+    app.wake_phrase_start = daemon_module.WAKE_PHRASE_START_DEFAULT
+    app.wake_phrase_stop = daemon_module.WAKE_PHRASE_STOP_DEFAULT
+    app._recording_from_wake = False
+    app._recording_by_phone = False
+    app._recording_mic_from_phone = False
+    app._phone_audio = None
+    app._phone_audio_conn = None
+    app.silence_timeout = daemon_module.SILENCE_TIMEOUT_DEFAULT
+    app._silence_stop = None
+    app._silence_thread = None
+    # listener mai avviato: come con l'attivazione vocale spenta, tutte le
+    # chiamate del demone verso di lui sono no-op (vedi WakeWordListener)
+    app.wake_listener = daemon_module.WakeWordListener(
+        None,
+        app.command_queue,
+        lambda: (app.wake_phrase_start, app.wake_phrase_stop),
+        lambda: app.model.language,
+    )
     app._media_players = []
     app._paused_for_recording = []
     app._muted_for_recording = []

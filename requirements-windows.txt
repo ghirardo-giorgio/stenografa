@@ -10,13 +10,12 @@ pyperclip
 plyer
 requests
 
-# Non specifica di Windows (serve anche su Linux/macOS per la trascrizione,
-# vedi daemon.py): elencata qui perche' non esiste un requirements.txt di
-# base nel repo.
+# Base dependencies (faster_whisper, requests, ...) live in requirements.txt:
+# install that file first, then this one.
 #
-# ATTENZIONE: su Windows richiede anche il Microsoft Visual C++
-# Redistributable x64 installato a livello di sistema (non installabile via
-# pip), altrimenti l'import fallisce con FileNotFoundError su ctranslate2.dll
-# (mancano vcruntime140.dll/vcruntime140_1.dll/msvcp140.dll):
+# ATTENZIONE: su Windows faster_whisper/ctranslate2 richiedono inoltre il
+# Microsoft Visual C++ Redistributable x64 installato a livello di sistema
+# (non installabile via pip), altrimenti l'import fallisce con
+# FileNotFoundError su ctranslate2.dll (mancano
+# vcruntime140.dll/vcruntime140_1.dll/msvcp140.dll):
 #   winget install --id Microsoft.VCRedist.2015+.x64 -e
-faster_whisper

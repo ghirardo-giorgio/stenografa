@@ -655,7 +655,10 @@ def get_config() -> dict:
     `translate_engine` (vedi set_translate_enabled/set_translate_target/
     set_translate_engine), `vocabulary` (vedi set_vocabulary),
     `confirm_before_paste` (vedi set_confirm_before_paste), `require_tls`
-    (vedi set_require_tls) piu' due campi informativi di sola lettura:
+    (vedi set_require_tls), `wake_word_enabled`, `wake_phrase_start` e
+    `wake_phrase_stop` (attivazione vocale, vedi set_wake_word_enabled),
+    `silence_timeout` (chiusura automatica sul silenzio, vedi
+    set_silence_timeout) piu' due campi informativi di sola lettura:
     `tls_available` (se il demone ha un certificato con cui cifrare il
     canale) e `tls_fingerprint` (l'impronta SHA-1 che l'app telefono fissa
     al primo collegamento)."""
@@ -707,6 +710,27 @@ def set_pause_media_while_recording(enabled: bool) -> dict:
     pulsante play/pausa per ogni video in riproduzione."""
     return _control_request(
         {"cmd": "set_pause_media_while_recording", "enabled": enabled}
+    )["config"]
+
+
+@mcp.tool()
+def set_notifications(level: str) -> dict:
+    """Sceglie quante notifiche di sistema (GNOME/Windows/macOS) manda il
+    demone. `level` puo' essere:
+
+    - "all": tutte, com'e' di default (errori, "Nessun testo rilevato",
+      conferme richieste, comandi eseguiti, applicazioni avviate);
+    - "errors": solo quelle critiche, cioe' gli errori di trascrizione, di
+      traduzione e di rete: e' la scelta giusta per chi trova invadente il
+      messaggio che compare a fine dettatura ma vuole comunque sapere se
+      qualcosa e' andato storto;
+    - "none": nessuna notifica di sistema.
+
+    Non tocca quello che l'app telefono riceve: stati, risultati, richieste
+    di conferma e messaggi di errore continuano ad arrivarle in ogni caso,
+    quindi silenziare le notifiche non nasconde nulla."""
+    return _control_request(
+        {"cmd": "set_notifications", "level": level}
     )["config"]
 
 
@@ -799,6 +823,67 @@ def set_require_tls(enabled: bool) -> dict:
     mancante sul PC), invece di rendere il demone irraggiungibile."""
     return _control_request(
         {"cmd": "set_require_tls", "enabled": enabled}
+    )["config"]
+
+
+@mcp.tool()
+def set_wake_word_enabled(enabled: bool) -> dict:
+    """Attiva/disattiva l'attivazione vocale: con questa accesa la dettatura
+    si avvia e si ferma pronunciando due frasi scelte dall'utente (vedi
+    set_wake_phrase_start/set_wake_phrase_stop), senza toccare il pulsante
+    sul telefono. Il demone tiene aperto il microfono del PC e trascrive di
+    continuo, con un modello Whisper piccolo su CPU che non occupa la memoria
+    della scheda video: il costo e' qualche punto percentuale di CPU. Spenta
+    di default, perche' tenere il microfono sempre aperto deve essere una
+    scelta esplicita. L'app telefono ha in piu' un suo interruttore, separato
+    da questo, per ascoltare le stesse frasi dal microfono del telefono."""
+    return _control_request(
+        {"cmd": "set_wake_word_enabled", "enabled": enabled}
+    )["config"]
+
+
+@mcp.tool()
+def set_wake_phrase_start(phrase: str) -> dict:
+    """Frase che avvia la dettatura quando l'attivazione vocale e' accesa
+    (vedi set_wake_word_enabled). Default "jarvis". Deve avere almeno 3
+    caratteri: frasi piu' corte verrebbero riconosciute dentro le parole di
+    una conversazione normale. Conviene una parola che non ricorra nel parlato
+    di tutti i giorni — un nome proprio inventato e' la scelta migliore. Il
+    riconoscimento tollera gli errori di trascrizione, quindi non serve
+    pronunciarla in modo perfetto. Se la frase viene captata anche dalla
+    dettatura vera e propria, il demone la toglie dal testo prima di
+    incollarlo."""
+    return _control_request(
+        {"cmd": "set_wake_phrase_start", "phrase": phrase}
+    )["config"]
+
+
+@mcp.tool()
+def set_wake_phrase_stop(phrase: str) -> dict:
+    """Frase che chiude la dettatura e ne fa trascrivere il contenuto (vedi
+    set_wake_word_enabled). Default "jarvis stop". Vanno bene gli stessi
+    criteri di set_wake_phrase_start, e deve essere diversa dalla frase di
+    avvio. Conviene che sia la frase di avvio piu' una parola ("jarvis" ->
+    "jarvis stop"): e' facile da ricordare e non rischia di scattare da
+    sola."""
+    return _control_request(
+        {"cmd": "set_wake_phrase_stop", "phrase": phrase}
+    )["config"]
+
+
+@mcp.tool()
+def set_silence_timeout(seconds: int) -> dict:
+    """Dopo quanti secondi di silenzio la dettatura si chiude da sola,
+    trascrivendo e incollando quello che ha raccolto fino a quel momento. 10
+    di default; 0 la disattiva; altrimenti da 3 a 120 secondi (sotto i 3 una
+    pausa per riprendere fiato basterebbe a interrompere la dettatura). Vale
+    per la dettatura "a interruttore", comunque sia partita — dal pulsante,
+    dalla scorciatoia da tastiera o dall'attivazione vocale — ed e' comoda
+    soprattutto con quest'ultima, dove capita di dimenticare la frase di stop.
+    Non si applica al "tieni premuto per parlare", dove e' il rilascio del dito
+    a chiudere. Il nuovo valore vale dalla dettatura successiva."""
+    return _control_request(
+        {"cmd": "set_silence_timeout", "seconds": seconds}
     )["config"]
 
 

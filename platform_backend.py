@@ -31,6 +31,7 @@ in cui servono: vedi requirements-windows.txt / requirements-macos.txt.
 """
 import platform
 import subprocess
+import threading
 import time
 
 
@@ -48,12 +49,18 @@ def _current_os():
 class Backend:
     """Interfaccia comune implementata da ogni backend per sistema operativo."""
 
-    def start_recording(self, wav_path):
-        """Avvia la registrazione del microfono su file (mono, 16kHz, s16)."""
+    def start_recording(self, wav_path, slot="main"):
+        """Avvia la registrazione del microfono su file (mono, 16kHz, s16).
+
+        `slot` identifica la cattura: "main" e' la dettatura vera, "wake"
+        l'ascolto continuo della frase di attivazione (vedi WakeWordListener
+        in daemon.py). Slot diversi sono indipendenti, cosi' l'ascolto puo'
+        essere avviato e fermato senza interferire con una dettatura in corso.
+        """
         raise NotImplementedError
 
-    def stop_recording(self):
-        """Ferma la registrazione avviata da start_recording."""
+    def stop_recording(self, slot="main"):
+        """Ferma la registrazione avviata da start_recording sullo stesso slot."""
         raise NotImplementedError
 
     def copy_to_clipboard(self, text):
@@ -71,6 +78,16 @@ class Backend:
 
     def notify(self, title, body, urgency="normal"):
         raise NotImplementedError
+
+    def show_dictation_overlay(self, state):
+        """Mostra a schermo che la dettatura e' in corso, o la toglie quando
+        `state` non e' uno stato da segnalare.
+
+        Serve soprattutto all'attivazione vocale: partendo senza toccare
+        niente, senza un riscontro sullo schermo non si sa se il microfono e'
+        aperto. Chi non la implementa non mostra nulla: e' un di piu', non
+        deve mai far fallire una dettatura."""
+        return
 
     def get_focused_window(self):
         """Ritorna (id, app_name, title) della finestra/app col focus, o
@@ -357,16 +374,18 @@ class LinuxBackend(Backend):
         import os
 
         self._runtime_dir = runtime_dir
-        self._record_proc = None
+        # un processo pw-record per slot (vedi Backend.start_recording)
+        self._record_procs = {}
         self._ydotoold_proc = None
         self._ydotool_socket_path = os.path.join(
             runtime_dir, "stenografa-ydotool.sock"
         )
 
-    def start_recording(self, wav_path):
+    def start_recording(self, wav_path, slot="main"):
         import subprocess
 
-        self._record_proc = subprocess.Popen(
+        self.stop_recording(slot)
+        self._record_procs[slot] = subprocess.Popen(
             [
                 "pw-record",
                 "--channels=1",
@@ -378,9 +397,8 @@ class LinuxBackend(Backend):
             stderr=subprocess.DEVNULL,
         )
 
-    def stop_recording(self):
-        proc = self._record_proc
-        self._record_proc = None
+    def stop_recording(self, slot="main"):
+        proc = self._record_procs.pop(slot, None)
         if proc is None:
             return
         proc.terminate()
@@ -469,6 +487,45 @@ class LinuxBackend(Backend):
             ["notify-send", "-u", urgency, "-a", "Stenografa", title, body],
             check=False,
         )
+
+    # --- riquadro "sto dettando" ---
+    # Lo disegna l'estensione GNOME "stenografa-overlay": sta sopra tutto, non
+    # prende il puntatore e soprattutto non prende il fuoco — cosa da non
+    # sottovalutare, visto che il testo dettato viene incollato nella finestra
+    # che ce l'ha.
+    #
+    # Se l'estensione non e' attiva non si mostra nulla. C'era una notifica di
+    # sistema come ripiego, ma una notifica che resta aperta per tutta la
+    # dettatura da' piu' fastidio del problema che risolve.
+    #
+    # Su Wayland non esiste un'altra strada: una finestra normale non puo'
+    # imporsi sopra le altre, e per farsi vedere dovrebbe rubare il fuoco.
+
+    def show_dictation_overlay(self, state):
+        # non deve mai rallentare l'avvio della registrazione: la chiamata
+        # costa una manciata di millisecondi, ma la dettatura non la aspetta
+        threading.Thread(
+            target=self._overlay_worker, args=(state,), daemon=True
+        ).start()
+
+    def _overlay_worker(self, state):
+        try:
+            subprocess.run(
+                [
+                    "gdbus", "call", "--session",
+                    "--dest", "org.stenografa.Overlay",
+                    "--object-path", "/org/stenografa/Overlay",
+                    "--method", "org.stenografa.Overlay.SetState",
+                    state,
+                ],
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            # il riquadro e' un di piu': se non si riesce a mostrarlo, la
+            # dettatura prosegue comunque
+            pass
 
     def get_focused_window(self):
         import ast
@@ -767,33 +824,37 @@ class WindowsBackend(Backend):
     con una macchina/VM Windows prima di usarlo in produzione."""
 
     def __init__(self):
-        self._stream = None
-        self._sound_file = None
+        # uno stream e un file per slot (vedi Backend.start_recording)
+        self._streams = {}
+        self._sound_files = {}
 
-    def start_recording(self, wav_path):
+    def start_recording(self, wav_path, slot="main"):
         import sounddevice as sd
         import soundfile as sf
 
-        self._sound_file = sf.SoundFile(
+        self.stop_recording(slot)
+        sound_file = sf.SoundFile(
             wav_path, mode="w", samplerate=16000, channels=1, subtype="PCM_16"
         )
+        self._sound_files[slot] = sound_file
 
         def _callback(indata, frames, time_info, status):
-            self._sound_file.write(indata)
+            sound_file.write(indata)
 
-        self._stream = sd.InputStream(
+        stream = sd.InputStream(
             samplerate=16000, channels=1, dtype="int16", callback=_callback
         )
-        self._stream.start()
+        self._streams[slot] = stream
+        stream.start()
 
-    def stop_recording(self):
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-        if self._sound_file is not None:
-            self._sound_file.close()
-            self._sound_file = None
+    def stop_recording(self, slot="main"):
+        stream = self._streams.pop(slot, None)
+        if stream is not None:
+            stream.stop()
+            stream.close()
+        sound_file = self._sound_files.pop(slot, None)
+        if sound_file is not None:
+            sound_file.close()
 
     def copy_to_clipboard(self, text):
         import pyperclip
@@ -1000,33 +1061,37 @@ class MacBackend(Backend):
     titolo richiederebbe anch'esso il permesso di Accessibilita'."""
 
     def __init__(self):
-        self._stream = None
-        self._sound_file = None
+        # uno stream e un file per slot (vedi Backend.start_recording)
+        self._streams = {}
+        self._sound_files = {}
 
-    def start_recording(self, wav_path):
+    def start_recording(self, wav_path, slot="main"):
         import sounddevice as sd
         import soundfile as sf
 
-        self._sound_file = sf.SoundFile(
+        self.stop_recording(slot)
+        sound_file = sf.SoundFile(
             wav_path, mode="w", samplerate=16000, channels=1, subtype="PCM_16"
         )
+        self._sound_files[slot] = sound_file
 
         def _callback(indata, frames, time_info, status):
-            self._sound_file.write(indata)
+            sound_file.write(indata)
 
-        self._stream = sd.InputStream(
+        stream = sd.InputStream(
             samplerate=16000, channels=1, dtype="int16", callback=_callback
         )
-        self._stream.start()
+        self._streams[slot] = stream
+        stream.start()
 
-    def stop_recording(self):
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-        if self._sound_file is not None:
-            self._sound_file.close()
-            self._sound_file = None
+    def stop_recording(self, slot="main"):
+        stream = self._streams.pop(slot, None)
+        if stream is not None:
+            stream.stop()
+            stream.close()
+        sound_file = self._sound_files.pop(slot, None)
+        if sound_file is not None:
+            sound_file.close()
 
     def copy_to_clipboard(self, text):
         import pyperclip
