@@ -411,4 +411,4 @@ re-paste, and more.
   Wine/Lutris is not reliable for cross-app pasting and notifications — a real
   machine (or a Windows VM) is needed. There is no macOS virtualization on
   non-Apple hardware.
-- **License**: [MIT](LICENSE) — © 2025 Giorgio Ghirardo.
+- **License**: [MIT](LICENSE) — © 2026 Giorgio Ghirardo.
